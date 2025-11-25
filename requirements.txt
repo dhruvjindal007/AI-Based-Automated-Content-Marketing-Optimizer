@@ -1,0 +1,72 @@
+# Core Python Utilities
+python-dotenv
+requests
+aiohttp
+
+
+# LLM / Content Generation
+groq
+google-generativeai
+genai
+
+# Trend Analysis
+pytrends
+
+
+# Sentiment Analysis
+textblob
+langdetect
+transformers
+torch
+
+
+datetime
+
+# Grammar, Readability
+language-tool-python
+textstat
+
+
+# Google Sheets Integration
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+
+
+# Scheduler (A/B Posting & Auto Retrain)
+APScheduler
+
+
+# Slack Notifications
+slack_sdk
+
+
+# Streamlit Dashboard
+streamlit
+pandas
+matplotlib
+
+
+# Machine Learning (Model Training)
+numpy
+scikit-learn
+joblib
+imblearn
+
+
+# Social Data Ingestion
+praw
+tweepy
+
+
+# Utility Libraries
+beautifulsoup4
+lxml
+
+
+# Optional (if you use emojis or advanced text handling)
+emoji
+
+
+spacy
