@@ -1,24 +1,3 @@
-"""
-UPDATED run.py
---------------
-This script runs the FULL end-to-end AI Content Marketing Optimizer:
-
-Pipeline Steps:
----------------
-1. Generate content variations  (content_generator3)
-2. Trend optimization           (trend_based_optimizer3)
-3. Sentiment analysis           (sentiment_analyzer2)
-4. A/B Comparison (simple) OR Full posting  (ABCoach)
-5. Log raw feedback + aggregates (tracker3)
-6. Push metrics to Google Sheets (metrics_tracker2)
-7. Auto-train ML model           (auto_retrainer)
-8. Slack report summary          (slack_notifier2)
-
-Run:
-----
-python run.py
-"""
-
 import logging
 import pandas as pd
 
