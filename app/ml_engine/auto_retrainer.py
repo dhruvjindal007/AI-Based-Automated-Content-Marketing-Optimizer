@@ -9,7 +9,7 @@ from apscheduler.schedulers.background import BackgroundScheduler
 # Integrations
 from app.integrations.sheets_connector import read_rows, append_row
 from app.integrations.social_ingestor import SocialIngestor
-from app.integrations.slack_notifier3 import SlackNotifier
+from app.integrations.slack_notifier import SlackNotifier
 
 # AI Components
 from app.sentiment_engine.sentiment_analyzer import analyze_sentiment

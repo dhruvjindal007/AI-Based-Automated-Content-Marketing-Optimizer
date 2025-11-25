@@ -107,16 +107,30 @@ def run_pipeline():
     logger.info(f"\nA/B Result: {result}")
     log_campaign_event("A/B Comparison Completed", result)
 
-    winner_text = A if result["recommended"] == "A" else B
+    # Ensure consistent keys
+    recommended = result.get("winner") or result.get("recommended")
+    scoreA = result.get("probA") or result.get("scoreA") or 0
+    scoreB = result.get("probB") or result.get("scoreB") or 0
+
+    if not recommended:
+        recommended = "A" if scoreA >= scoreB else "B"
+
+    # final winner text
+    winner_text = A if recommended == "A" else B
+
+    # We must now patch result so downstream code works
+    result["recommended"] = recommended
+    result["probA"] = scoreA
+    result["probB"] = scoreB
 
     # Record campaign metrics for ML
     record_campaign_metrics(
         campaign_id="demo_campaign",
-        variant=result["recommended"],
+        variant=recommended,
         impressions=1000,
         clicks=80,
         conversions=8,
-        sentiment_score = result["probA"] if result["recommended"] == "A" else result["probB"],
+        sentiment_score=scoreA if recommended == "A" else scoreB,
         trend_score=50.0
     )
 

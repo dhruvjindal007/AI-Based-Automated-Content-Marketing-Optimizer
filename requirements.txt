@@ -3,29 +3,24 @@ python-dotenv
 requests
 aiohttp
 
-
 # LLM / Content Generation
 groq
 google-generativeai
 genai
+tiktoken==0.7.0
 
 # Trend Analysis
 pytrends
 
-
 # Sentiment Analysis
 textblob
-langdetect
-transformers
-torch
+langdetect==1.0.9
+transformers==4.41.2
+torch==2.2.2 --index-url https://download.pytorch.org/whl/cu118
 
-
-datetime
-
-# Grammar, Readability
+# Grammar & Readability
 language-tool-python
 textstat
-
 
 # Google Sheets Integration
 google-api-python-client
@@ -33,40 +28,33 @@ google-auth
 google-auth-oauthlib
 google-auth-httplib2
 
-
-# Scheduler (A/B Posting & Auto Retrain)
+# Scheduler
 APScheduler
-
 
 # Slack Notifications
 slack_sdk
-
 
 # Streamlit Dashboard
 streamlit
 pandas
 matplotlib
 
-
-# Machine Learning (Model Training)
+# Machine Learning
 numpy
 scikit-learn
 joblib
 imblearn
 
-
-# Social Data Ingestion
+# Social APIs
 praw
 tweepy
-
 
 # Utility Libraries
 beautifulsoup4
 lxml
 
-
-# Optional (if you use emojis or advanced text handling)
+# Emoji / NLP Utils
 emoji
 
-
-spacy
+# NLP Engine
+spacy==3.7.2

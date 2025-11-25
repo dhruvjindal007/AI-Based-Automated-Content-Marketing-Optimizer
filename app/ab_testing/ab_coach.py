@@ -1,4 +1,4 @@
-# ab_coach2.py
+# ab_coach.py
 """
 A/B Testing
 """
@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from app.integrations.social_poster import SocialPoster
 from app.integrations.social_ingestor import SocialIngestor
 from app.integrations.sheets_connector import append_row, read_rows, update_row, find_row
-from app.integrations.slack_notifier3 import SlackNotifier
+from app.integrations.slack_notifier import SlackNotifier
 
 from app.sentiment_engine.sentiment_analyzer import analyze_sentiment, analyze_post_comments
 from app.integrations.trend_fetcher import TrendFetcher
@@ -260,9 +260,12 @@ class ABCoach:
             "postB": postB,
             "scoreA": int(scoreA),
             "scoreB": int(scoreB),
+            "probA": float(compositeA),
+            "probB": float(compositeB),
             "compositeA": compositeA,
             "compositeB": compositeB,
             "winner": winner,
+            "recommended": winner,
             "comment_info_A": comment_info_A,
             "comment_info_B": comment_info_B
         }
@@ -347,7 +350,10 @@ class ABCoach:
         return {
             "scoreA": float(scoreA),
             "scoreB": float(scoreB),
+            "probA": float(scoreA),
+            "probB": float(scoreB),
             "winner": winner,
+            "recommended": winner,
             "explanation": explanation
         }
 

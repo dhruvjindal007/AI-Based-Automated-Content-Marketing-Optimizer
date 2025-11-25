@@ -17,3 +17,11 @@ node_modules/
 
 models/
 data/
+
+service_account.json
+
+*.pyo
+*.pyd
+.vscode/
+.idea/
+.DS_Store
