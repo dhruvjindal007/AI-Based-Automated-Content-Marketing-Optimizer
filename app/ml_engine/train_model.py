@@ -44,7 +44,7 @@ from sklearn.metrics import (
 from imblearn.over_sampling import SMOTE
 
 # Updated import — now using metrics_hub2 instead of metrics_hub3
-from app.metrics_engine.metrics_hub2 import get_ml_training_data
+from app.metrics_engine.metrics_hub import get_ml_training_data
 
 
 # ================================================================
