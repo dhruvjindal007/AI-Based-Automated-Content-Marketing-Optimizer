@@ -1,8 +1,7 @@
 """
-Streamlit App (app4.py)
-
+Streamlit App (app.py)
 Run:
-    streamlit run app4.py
+    streamlit run app.py
 """
 
 import streamlit as st
