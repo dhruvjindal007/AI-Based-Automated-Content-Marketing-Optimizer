@@ -15,6 +15,5 @@ __pycache__/
 # Node modules (if React frontend also exists)
 node_modules/
 
-.data
-
-.models
+models/
+data/
