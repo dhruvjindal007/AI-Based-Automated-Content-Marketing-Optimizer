@@ -307,7 +307,7 @@ Complete UI for interacting with all modules:
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/springboardmentor587-star/AI-Based-Automated-Content-Marketing-Optimizer.git
+git clone https://github.com/dhruvjindal007/AI-Based-Automated-Content-Marketing-Optimizer.git
 cd AI-Content-Marketing-Optimizer
 ```
 
@@ -422,6 +422,13 @@ The **AutoRetrainer** also saves:
 * `models/model_TIMESTAMP.pkl`
 
 ---
+## 👥 Contributors
+
+### 👨‍💼 Project Lead  
+- **Charan Teja Mangali** — Lead Developer, System Architect & Mentor
+
+### 🎓 Student Contributors  
+- **Dhruv Jindal**
 
 ## 🤝 Contributing
 

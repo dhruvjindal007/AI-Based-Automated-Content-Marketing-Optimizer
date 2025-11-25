@@ -18,7 +18,7 @@ from app.metrics_engine.metrics_tracker import push_daily_metrics
 from app.metrics_engine.metrics_hub import record_campaign_metrics, fetch_recent_metrics
 from app.ml_engine.train_model import train
 from app.ml_engine.auto_retrainer import AutoRetrainer
-from app.integrations.slack_notifier3 import SlackNotifier
+from app.integrations.slack_notifier import SlackNotifier
 
 
 # Safe defaults UI

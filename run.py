@@ -15,7 +15,7 @@ from app.metrics_engine.metrics_hub import record_campaign_metrics
 from app.ab_testing.ab_coach import ABCoach
 from app.ml_engine.auto_retrainer import AutoRetrainer
 
-from app.integrations.slack_notifier3 import SlackNotifier
+from app.integrations.slack_notifier import SlackNotifier
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
