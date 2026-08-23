@@ -1,11 +1,10 @@
-# metrics_tracker2.py (UPDATED)
 """
-Updated metrics_tracker2.py
+metrics_tracker.py
 
 Integrations:
 - integrations.social_ingestor.SocialIngestor  -> fetch live post metrics (likes, replies, shares)
 - integrations.trend_fetcher.TrendFetcher      -> trend scores for text
-- sentiment_analyzer2.analyze_sentiment       -> sentiment scoring for text/comments
+- sentiment_analyzer.analyze_sentiment         -> sentiment scoring for text/comments
 - integrations.sheets_connector.append_row     -> unified Google Sheets writes
 
 Features:
@@ -41,6 +40,14 @@ SHEET_LOG_ENABLED = bool(os.getenv("GOOGLE_SHEET_ID"))
 DEFAULT_SHEET_NAME = os.getenv("METRICS_SHEET_NAME", "daily_metrics")
 
 # Instantiate integrations (singletons for reuse)
+#
+# NOTE: unlike sentiment_analyzer.py and metrics_hub.py, these are still
+# built eagerly at import time rather than as lazy singletons. Since
+# run_pipeline.py and streamlit_app.py both import this module
+# unconditionally, every process startup pays the SocialIngestor/TrendFetcher
+# handshake cost immediately, whether or not metrics are ever pushed.
+# Left as-is here since this is a sync-error fix, not a refactor -- flag if
+# you want this converted to the lazy pattern the other two modules use.
 _ingestor = SocialIngestor()
 _trends = TrendFetcher()
 

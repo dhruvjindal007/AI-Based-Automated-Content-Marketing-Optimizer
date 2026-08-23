@@ -7,7 +7,6 @@ import pandas as pd
 
 from app.content_engine.content_generator import generate_final_variations
 from app.sentiment_engine.sentiment_analyzer import analyze_sentiment
-from app.content_engine.trend_based_optimizer import TrendBasedOptimizer
 from app.metrics_engine.tracker import push_raw_feedback, push_aggregates, log_campaign_event
 from app.metrics_engine.metrics_tracker import push_daily_metrics
 from app.metrics_engine.metrics_hub import record_campaign_metrics
@@ -19,9 +18,6 @@ from app.integrations.slack_notifier import SlackNotifier
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
-
-# Trend optimizer instance
-optimizer = TrendBasedOptimizer()
 
 logger = logging.getLogger("RUN-PIPELINE")
 logging.basicConfig(level=logging.INFO)
@@ -36,9 +32,22 @@ def run_pipeline():
     logger.info("==============================")
 
     # --------------------------------------
-    # STEP 1: CONTENT GENERATION
+    # STEP 1: CONTENT GENERATION (includes trend optimization internally)
     # --------------------------------------
-    logger.info("\n[1] Generating content variations...")
+    # generate_final_variations() already runs TrendBasedOptimizer.run() on
+    # each raw variant as part of its own pipeline (see content_generator.py
+    # Step 2 -- hashtag cleanup, trend-line injection, and a trend_scores
+    # sheet log all happen in there). v["text"] below is that already-
+    # optimized, final copy.
+    #
+    # FIX: this file used to call optimizer.run(v["text"]) a *second* time
+    # on that already-optimized text. That re-analysis would (a) sometimes
+    # append a second "Trending now: ..." / "People are searching for: ..."
+    # block on top of the first, so sentiment analysis ran on contaminated
+    # text instead of real marketing copy, and (b) write a second, spurious
+    # row to the trend_scores sheet for the same content. Removed entirely
+    # -- there is nothing left to optimize here.
+    logger.info("\n[1] Generating content variations (trend-optimized)...")
 
     variations = generate_final_variations(
         topic="AI in Marketing",
@@ -53,22 +62,13 @@ def run_pipeline():
         logger.info(f"\n--- Variant {i} ---\n{v['text']}\n")
 
     # --------------------------------------
-    # STEP 2: TREND OPTIMIZATION
+    # STEP 2: SENTIMENT ANALYSIS
     # --------------------------------------
-    logger.info("\n[2] Applying Trend Optimization...")
-    optimized = []
-    for v in variations:
-        out = optimizer.run(v["text"])
-        optimized.append(out)
-
-    # --------------------------------------
-    # STEP 3: SENTIMENT ANALYSIS
-    # --------------------------------------
-    logger.info("\n[3] Running Sentiment Analysis...")
-    sent_items = [v["optimized"] for v in optimized]
+    logger.info("\n[2] Running Sentiment Analysis...")
+    sent_items = [v["text"] for v in variations]
     sentiment_out = analyze_sentiment(sent_items)
 
-    # Raw feedback structure for tracker3
+    # Raw feedback structure for tracker
     raw_logs = []
     for i, s in enumerate(sentiment_out):
         raw_logs.append({
@@ -94,34 +94,28 @@ def run_pipeline():
     })
 
     # --------------------------------------
-    # STEP 4: A/B TEST (SIMPLE VERSION)
+    # STEP 3: A/B TEST (SIMPLE VERSION)
     # --------------------------------------
-    logger.info("\n[4] Running A/B Comparison (Simple)...")
+    logger.info("\n[3] Running A/B Comparison (Simple)...")
     coach = ABCoach()
 
-    A = optimized[0]["optimized"]
-    B = optimized[1]["optimized"]
+    A = variations[0]["text"]
+    B = variations[1]["text"]
 
     result = coach.simulate_ab(A, B)
 
     logger.info(f"\nA/B Result: {result}")
     log_campaign_event("A/B Comparison Completed", result)
 
-    # Ensure consistent keys
-    recommended = result.get("winner") or result.get("recommended")
-    scoreA = result.get("probA") or result.get("scoreA") or 0
-    scoreB = result.get("probB") or result.get("scoreB") or 0
+    # simulate_ab() always returns both key styles now (scoreA/scoreB/winner
+    # AND probA/probB/recommended), so no .get() fallback juggling is needed
+    # here anymore -- kept as a defensive read in case that ever changes.
+    recommended = result.get("recommended") or result.get("winner")
+    scoreA = result.get("probA", result.get("scoreA", 0))
+    scoreB = result.get("probB", result.get("scoreB", 0))
 
     if not recommended:
         recommended = "A" if scoreA >= scoreB else "B"
-
-    # final winner text
-    winner_text = A if recommended == "A" else B
-
-    # We must now patch result so downstream code works
-    result["recommended"] = recommended
-    result["probA"] = scoreA
-    result["probB"] = scoreB
 
     # Record campaign metrics for ML
     record_campaign_metrics(
@@ -135,9 +129,9 @@ def run_pipeline():
     )
 
     # --------------------------------------
-    # STEP 5: PUSH DAILY METRICS TO SHEETS
+    # STEP 4: PUSH DAILY METRICS TO SHEETS
     # --------------------------------------
-    logger.info("\n[5] Pushing Metrics to Google Sheets...")
+    logger.info("\n[4] Pushing Metrics to Google Sheets...")
     df = pd.DataFrame({
         "impressions": [1000],
         "clicks": [80],
@@ -154,9 +148,9 @@ def run_pipeline():
     push_daily_metrics(df)
 
     # --------------------------------------
-    # STEP 6: AUTO RETRAIN MODEL
+    # STEP 5: AUTO RETRAIN MODEL
     # --------------------------------------
-    logger.info("\n[6] Training ML Model (Auto Retrainer)...")
+    logger.info("\n[5] Training ML Model (Auto Retrainer)...")
     try:
         retrainer = AutoRetrainer()
         retrainer.run()
@@ -164,12 +158,12 @@ def run_pipeline():
         logger.error(f"Auto Retrainer failed: {e}")
 
     # --------------------------------------
-    # STEP 7: SLACK SUMMARY
+    # STEP 6: SLACK SUMMARY
     # --------------------------------------
-    logger.info("\n[7] Sending Slack Summary...")
+    logger.info("\n[6] Sending Slack Summary...")
     try:
         slack = SlackNotifier()
-        slack.send_message(f"A/B Winner: {result['recommended']}\nScore: {result}")
+        slack.send_message(f"A/B Winner: {recommended}\nScore: {result}")
     except Exception as e:
         logger.warning(f"Slack notification failed: {e}")
 

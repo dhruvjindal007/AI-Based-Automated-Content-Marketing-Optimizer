@@ -1,5 +1,5 @@
 """
-trend_based_optimizer.py
+trend_based_optimizer3.py
 --------------------------
 Enhances generated marketing content using real trend signals from:
 
@@ -56,6 +56,24 @@ class OptimizationResult:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    # ------------------------------------------------------------
+    # Dict-style access for backward compatibility with existing
+    # call sites (e.g. content_generator.py's opt["optimized"]) that
+    # predate this class and haven't been migrated to attribute
+    # access yet. Remove once every caller uses opt.optimized instead.
+    # ------------------------------------------------------------
+    def __getitem__(self, key: str) -> Any:
+        try:
+            return getattr(self, key)
+        except AttributeError as exc:
+            raise KeyError(key) from exc
+
+    def __contains__(self, key: str) -> bool:
+        return hasattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
 
 
 class TrendBasedOptimizer:

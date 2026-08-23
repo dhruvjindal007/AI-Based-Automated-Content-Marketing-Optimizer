@@ -37,11 +37,10 @@ from app.integrations.trend_fetcher import TrendFetcher
 
 # train_pairwise (not train!) is the A/B-winner model matching the
 # 6-column pairwise feature set built in preprocess_data() below.
-# train_model3.train() is a different model (conversion "success"
-# prediction) with an incompatible signature and feature schema --
-# calling it here would raise at runtime.
+# train_model.train() is a different model (single-post conversion
+# "success" prediction, 5-column feature set) with an incompatible
+# signature and schema -- calling it here would raise at runtime.
 from app.ml_engine.train_model import train_pairwise
-
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -56,6 +55,18 @@ if not logger.handlers:
 REQUIRED_AB_COLUMNS = {"postA", "scoreA", "postB", "scoreB", "winner"}
 FEATURE_COLUMNS = ["sentA", "sentB", "trendA", "trendB", "engA", "engB"]
 
+# FIX (aligned with train_model.py): that module already defines the
+# intended naming convention for this model via
+# PairwiseTrainConfig.latest_model_path -> "models/pairwise_predictor.joblib",
+# mirroring how train()'s TrainConfig saves "models/predictor.joblib".
+# train_pairwise() itself deliberately does NOT save to disk (see its
+# docstring: "AutoRetrainer's own save_model/versioning handles
+# persistence"), so this file is responsible for actually writing files
+# that match that convention. The previous version of this file invented
+# its own unrelated scheme (pairwise_model_<ts>.pkl) that matched nothing
+# else in the codebase.
+PAIRWISE_MODEL_BASENAME = "pairwise_predictor"
+
 
 @dataclass
 class RetrainConfig:
@@ -66,6 +77,10 @@ class RetrainConfig:
     sheet_ab_results: str = "ab_test_results"
     sheet_model_versions: str = "model_versions"
     autostart_scheduler: bool = True
+
+    @property
+    def latest_model_path(self) -> str:
+        return os.path.join(self.model_dir, f"{PAIRWISE_MODEL_BASENAME}.joblib")
 
 
 class AutoRetrainer:
@@ -241,22 +256,33 @@ class AutoRetrainer:
     # 5. SAVE MODEL VERSION
     # --------------------------------------------------------------
     def save_model(self, model: Any, df: pd.DataFrame) -> Optional[str]:
+        """
+        Saves both a timestamped, versioned artifact and overwrites a
+        fixed "latest" path -- mirroring exactly how train_model.train()
+        persists the success model (predictor_<ts>.joblib +
+        predictor.joblib). train_pairwise() itself intentionally doesn't
+        do this (see its docstring), so this method owns it.
+        """
         timestamp = int(time.time())
-        path = os.path.join(self.config.model_dir, f"model_{timestamp}.pkl")
+        versioned_path = os.path.join(
+            self.config.model_dir, f"{PAIRWISE_MODEL_BASENAME}_{timestamp}.joblib"
+        )
+        latest_path = self.config.latest_model_path
 
         try:
-            joblib.dump(model, path)
+            joblib.dump(model, versioned_path)
+            joblib.dump(model, latest_path)
         except Exception as exc:
-            logger.error("Failed to save model to %s: %s", path, exc)
+            logger.error("Failed to save model to %s: %s", versioned_path, exc)
             return None
 
         try:
-            append_row(self.config.sheet_model_versions, [timestamp, len(df), path])
+            append_row(self.config.sheet_model_versions, [timestamp, len(df), versioned_path])
         except Exception as exc:
             logger.warning("Model saved locally but failed to log version to Sheets: %s", exc)
 
-        logger.info("New model saved: %s", path)
-        return path
+        logger.info("New model saved: %s (latest -> %s)", versioned_path, latest_path)
+        return versioned_path
 
     # --------------------------------------------------------------
     # 6. SLACK NOTIFICATION
@@ -302,7 +328,7 @@ class AutoRetrainer:
     # Simple run() wrapper for the pipeline
     # --------------------------------------------------------------
     def run(self) -> None:
-        """Required by run.py -- triggers one full retraining cycle."""
+        """Required by run_pipeline.py -- triggers one full retraining cycle."""
         logger.info("AutoRetrainer.run() invoked.")
         try:
             self.run_full_cycle()

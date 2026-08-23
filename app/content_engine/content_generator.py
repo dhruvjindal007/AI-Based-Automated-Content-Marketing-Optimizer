@@ -1,5 +1,5 @@
 # ============================================================
-# content_generator.py (UPDATED FULL VERSION)
+# content_generator.py
 # ============================================================
 import os
 import logging
@@ -28,7 +28,10 @@ from .dynamic_prompt import generate_engaging_prompt
 
 # Trend optimizer (real-time trends)
 from app.integrations.trend_fetcher import TrendFetcher
-from app.content_engine.trend_based_optimizer import TrendBasedOptimizer
+from app.content_engine.trend_based_optimizer import (
+    TrendBasedOptimizer,
+    OptimizationResult,
+)
 
 # Sheets logging
 from app.integrations.sheets_connector import append_row
@@ -48,23 +51,32 @@ except Exception:
 
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 if not logger.handlers:
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-    logger.addHandler(ch)
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
 
 
 # ============================================================
-# Lazy singletons (LLM clients + LanguageTool)
+# Lazy singletons (LLM clients + LanguageTool + trend components)
 # ============================================================
-# LanguageTool spins up a local Java server on construction -- doing
-# that once per process instead of once per score_quality() call is the
-# single biggest performance fix in this file.
+# Each of these does real network/process setup on construction --
+# PyTrends/Reddit/Twitter handshakes, a local Java grammar server, an
+# API client. Building them once per process instead of once per
+# generate_final_variations() call is the same fix already applied to
+# Groq/LanguageTool below, now extended to the trend components, which
+# were previously being reconstructed on every single call (visible in
+# logs as repeated "Initializing TrendFetcher..." lines per request).
 
 _groq_client = None
 _gemini_configured = False
 _language_tool = None
+_trend_fetcher = None
+_trend_optimizer = None
 
 
 def _get_groq_client() -> "Groq":
@@ -89,6 +101,24 @@ def _get_language_tool():
     return _language_tool
 
 
+def _get_trend_fetcher() -> TrendFetcher:
+    global _trend_fetcher
+    if _trend_fetcher is None:
+        logger.info("Starting TrendFetcher (one-time init)...")
+        _trend_fetcher = TrendFetcher()
+    return _trend_fetcher
+
+
+def _get_trend_optimizer() -> TrendBasedOptimizer:
+    global _trend_optimizer
+    if _trend_optimizer is None:
+        # Reuse the same TrendFetcher instead of letting the optimizer
+        # construct its own second one -- TrendBasedOptimizer accepts
+        # an injected fetcher for exactly this reason.
+        _trend_optimizer = TrendBasedOptimizer(fetcher=_get_trend_fetcher())
+    return _trend_optimizer
+
+
 # ============================================================
 # Local fallback
 # ============================================================
@@ -101,9 +131,16 @@ def _local_generate(prompt: str, n: int = 3) -> List[str]:
 # LLM Call Helpers
 # ============================================================
 
+# llama-3.3-70b-versatile was deprecated by Groq on 2026-06-17 and shut
+# down 2026-08-16. openai/gpt-oss-120b is Groq's recommended
+# replacement. Still overridable via GROQ_MODEL for accounts on a
+# different tier/model.
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+
+
 def _call_groq(prompt: str, model: str = None) -> str:
     client = _get_groq_client()
-    model = model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    model = model or os.getenv("GROQ_MODEL", DEFAULT_GROQ_MODEL)
 
     resp = client.chat.completions.create(
         messages=[{"role": "user", "content": prompt}],
@@ -130,8 +167,8 @@ def _call_gemini(prompt: str, model: str = None) -> str:
 def generate_variations(prompt: str, n: int = 2) -> List[str]:
     """
     Generate n variations using the strongest available LLM:
-      1. Groq → LLaMA 3.3
-      2. Gemini → 1.5 Flash
+      1. Groq
+      2. Gemini
       3. Local fallback
 
     Each individual call is guarded separately -- if some succeed and
@@ -242,7 +279,9 @@ def clean_and_order_hashtags(text: str):
 # Engagement-Aware Ranking
 # ============================================================
 
-def optimize_with_engagement(candidates: List[Dict], past_metrics: Optional[Dict] = None):
+def optimize_with_engagement(
+    candidates: List[OptimizationResult], past_metrics: Optional[Dict] = None
+) -> List[OptimizationResult]:
     top_keywords = []
     if past_metrics:
         top_keywords = list(past_metrics.get("top_keywords", []))[:3]
@@ -264,7 +303,14 @@ def optimize_with_engagement(candidates: List[Dict], past_metrics: Optional[Dict
             if kw.lower() in text.lower():
                 score += 0.2
 
-        c["engagement_score"] = score
+        # FIX: OptimizationResult defines __getitem__ for backward-compat
+        # reads (c.get(...) above works via that) but never defines
+        # __setitem__, so `c["engagement_score"] = score` raised
+        # "TypeError: 'OptimizationResult' object does not support item
+        # assignment". Attribute assignment works fine instead -- it's a
+        # plain dataclass instance (no __slots__), so setting a field that
+        # wasn't in the original @dataclass definition is still valid.
+        c.engagement_score = score
         scored.append((score, c))
 
     scored_sorted = sorted(scored, key=lambda x: x[0], reverse=True)
@@ -272,7 +318,7 @@ def optimize_with_engagement(candidates: List[Dict], past_metrics: Optional[Dict
 
 
 # ============================================================
-# FINAL PIPELINE — FULLY UPDATED
+# FINAL PIPELINE
 # ============================================================
 
 def _normalize_keyword(kw: str) -> str:
@@ -297,8 +343,9 @@ def generate_final_variations(
     if isinstance(keywords, str):
         keywords = [k.strip() for k in keywords.split(",") if k.strip()]
 
-    # NEW: Retrieve REAL trending keywords
-    tf = TrendFetcher()
+    # Retrieve real trending keywords via the shared, lazily-initialized
+    # TrendFetcher instead of constructing a fresh one per call.
+    tf = _get_trend_fetcher()
     real_trends = tf.fetch_google_global_trends()
 
     # Normalized de-dup: compare lowercased, '#'-stripped versions so
@@ -323,16 +370,22 @@ def generate_final_variations(
     # Step 1: Generate raw content
     raw_variants = generate_variations(prompt, n=n)
 
-    # Step 2: Trend-Based Optimization
-    optimizer = TrendBasedOptimizer()
+    # Step 2: Trend-Based Optimization (shared optimizer/fetcher --
+    # see _get_trend_optimizer)
+    optimizer = _get_trend_optimizer()
 
-    optimized_candidates = []
+    optimized_candidates: List[OptimizationResult] = []
     for text in raw_variants:
         opt = optimizer.run(text)
 
         # Hashtag cleanup
         cleaned = clean_and_order_hashtags(opt["optimized"])
-        opt["optimized_text"] = cleaned
+
+        # FIX: same TypeError as optimize_with_engagement() above --
+        # OptimizationResult has no __setitem__, only __getitem__.
+        # opt["optimized_text"] = cleaned crashed generate_final_variations()
+        # every time it ran. Attribute assignment works instead.
+        opt.optimized_text = cleaned
 
         optimized_candidates.append(opt)
 

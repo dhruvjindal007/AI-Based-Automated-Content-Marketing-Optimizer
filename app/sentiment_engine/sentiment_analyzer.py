@@ -1,4 +1,4 @@
-# sentiment_analyzer.py (UPDATED FULL VERSION)
+# sentiment_analyzer.py
 """
 Advanced sentiment_analyzer.py
 
@@ -14,7 +14,7 @@ Upgraded with:
 
 import json
 import logging
-from typing import List, Union, Dict
+from typing import List, Union, Dict, Optional
 
 from textblob import TextBlob
 
@@ -48,6 +48,7 @@ try:
     from app.integrations.social_ingestor import SocialIngestor
     SOCIAL_AVAILABLE = True
 except Exception as e:
+    SocialIngestor = None
     SOCIAL_AVAILABLE = False
     logger.warning("SocialIngestor unavailable, comment ingestion disabled: %s", e)
 
@@ -55,6 +56,7 @@ try:
     from app.integrations.trend_fetcher import TrendFetcher
     TREND_AVAILABLE = True
 except Exception as e:
+    TrendFetcher = None
     TREND_AVAILABLE = False
     logger.warning("TrendFetcher unavailable, trend_score will be None: %s", e)
 
@@ -69,9 +71,34 @@ except Exception as e:
 _senti_model = None
 _emotion_model = None
 
-# Fix #6: module-level singletons instead of per-call instantiation
-_trend_engine = TrendFetcher() if TREND_AVAILABLE else None
-_ingestor = SocialIngestor() if SOCIAL_AVAILABLE else None
+# Lazy singletons for the trend/ingestor clients. Previously these were
+# constructed eagerly at import time ("module-level singletons instead of
+# per-call instantiation"), which meant every process that imports this
+# module pays the TrendFetcher/SocialIngestor handshake cost immediately --
+# even if sentiment analysis is never actually called. This was also one of
+# three separate places doing an eager TrendFetcher() at import time (see
+# metrics_hub.py and metrics_tracker.py for the other two); ideally all
+# three would share one instance, but at minimum each should only build its
+# own on first use rather than unconditionally at startup.
+_trend_engine = None
+_ingestor = None
+
+
+def _get_trend_engine():
+    global _trend_engine
+    if TREND_AVAILABLE and _trend_engine is None:
+        logger.info("Starting TrendFetcher (one-time init)...")
+        _trend_engine = TrendFetcher()
+    return _trend_engine
+
+
+def _get_ingestor():
+    global _ingestor
+    if SOCIAL_AVAILABLE and _ingestor is None:
+        logger.info("Starting SocialIngestor (one-time init)...")
+        _ingestor = SocialIngestor()
+    return _ingestor
+
 
 VALID_LABELS = ("POSITIVE", "NEGATIVE", "NEUTRAL")
 
@@ -164,7 +191,8 @@ def analyze_post_comments(post_id: str) -> Dict:
     Fetches comments using SocialIngestor -> scores them ->
     returns aggregated sentiment & toxicity.
     """
-    if not SOCIAL_AVAILABLE or _ingestor is None:
+    ingestor = _get_ingestor()
+    if ingestor is None:
         logger.warning("analyze_post_comments called but SocialIngestor is unavailable.")
         return {
             "post_id": post_id,
@@ -175,7 +203,7 @@ def analyze_post_comments(post_id: str) -> Dict:
             "samples": []
         }
 
-    raw_comments = _ingestor.fetch_post_comments(post_id)
+    raw_comments = ingestor.fetch_post_comments(post_id)
 
     if not raw_comments:
         return {
@@ -243,7 +271,7 @@ def analyze_sentiment(texts: Union[str, List[str]]) -> List[Dict]:
     }
 
     Fix #1: this is the single place trend_score is computed. Downstream
-    callers (e.g. tracker3.push_raw_feedback) should read
+    callers (e.g. tracker.push_raw_feedback) should read
     result["trend_score"] instead of calling TrendFetcher again themselves.
     """
 
@@ -281,12 +309,36 @@ def analyze_sentiment(texts: Union[str, List[str]]) -> List[Dict]:
             s = fallback_sentiment(text)
             label, score, polarity = s["label"], s["score"], s["polarity"]
 
-        # Fix #4: the (1 - score) inversion only makes sense for a genuine
-        # HF softmax confidence. fallback_sentiment() already returns a
-        # normalized 0-1 positivity score, so it passes through unchanged.
+        # FIX: `score` from a genuine HF prediction is the model's
+        # confidence in *whichever label it picked* -- it is not, by
+        # itself, a positivity value. The old code only handled the
+        # POSITIVE/NEGATIVE cases correctly:
+        #
+        #   norm_score = (1 - score) if label.startswith("NEG") else score
+        #
+        # For a NEUTRAL prediction this fell into the `else` branch and
+        # passed the model's raw "how sure am I this is neutral" number
+        # straight through as sentiment_score. A confidently-neutral
+        # text (e.g. score=0.93) then looked, to every downstream
+        # consumer (ABCoach's composite score, AutoRetrainer's training
+        # features, metrics_hub's ctr/sentiment blend), like a
+        # confidently *positive* text -- because they all treat
+        # sentiment_score as a 0..1 positivity scale.
+        #
+        # A NEUTRAL call has no positive/negative direction, so it
+        # should land at the midpoint of that scale regardless of how
+        # confident the model was in calling it neutral.
         if used_hf:
-            norm_score = (1 - score) if label.startswith("NEG") else score
+            if label.startswith("NEG"):
+                norm_score = 1 - score
+            elif label.startswith("POS"):
+                norm_score = score
+            else:
+                norm_score = 0.5
         else:
+            # fallback_sentiment() already returns a normalized 0-1
+            # positivity score (see its docstring), so it passes
+            # through unchanged for all three labels.
             norm_score = score
 
         # EMOTION
@@ -301,9 +353,10 @@ def analyze_sentiment(texts: Union[str, List[str]]) -> List[Dict]:
 
         # TREND SCORE
         trend_score = None
-        if TREND_AVAILABLE and _trend_engine is not None:
+        trend_engine = _get_trend_engine()
+        if trend_engine is not None:
             try:
-                trend_score = _trend_engine.get_combined_trend_score(text)
+                trend_score = trend_engine.get_combined_trend_score(text)
             except Exception as e:
                 logger.warning("TrendFetcher failed for text: %s", e)
 

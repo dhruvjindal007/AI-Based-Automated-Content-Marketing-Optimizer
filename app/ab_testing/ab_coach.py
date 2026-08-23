@@ -1,6 +1,4 @@
-# ab_coach.py
 import os
-import joblib
 import logging
 from typing import Dict, Any, Optional, List, Tuple
 
@@ -22,7 +20,6 @@ if not logger.handlers:
     logger.addHandler(ch)
 
 
-MODEL_DIR = os.getenv("MODEL_DIR", "models")
 SHEETS_ENABLED = bool(os.getenv("GOOGLE_SHEET_ID"))
 
 # Composite score weights. Must sum to 1.0.
@@ -30,24 +27,36 @@ ENGAGEMENT_WEIGHT = 0.7
 SENTIMENT_WEIGHT = 0.2
 TREND_WEIGHT = 0.1
 
-
-def _load_latest_model() -> Optional[Any]:
-    """Load the most recent model artifact from MODEL_DIR using joblib."""
-    try:
-        files = []
-        if not os.path.exists(MODEL_DIR):
-            return None
-        for f in os.listdir(MODEL_DIR):
-            if f.endswith(".pkl") or f.endswith(".joblib"):
-                files.append(os.path.join(MODEL_DIR, f))
-        if not files:
-            return None
-        latest = max(files, key=os.path.getmtime)
-        logger.info(f"Loading model: {latest}")
-        return joblib.load(latest)
-    except Exception as e:
-        logger.warning(f"Could not load model: {e}")
-        return None
+# ----------------------------------------------------------------------
+# FIX: model loading for predict_success() removed entirely.
+#
+# predict_success() scores a SINGLE piece of text on 3 features:
+# [sentiment_score, trend_score, length]. Checking against train_model.py,
+# neither model actually produced anywhere in this codebase matches that
+# schema:
+#
+#   - train() / "predictor.joblib" (success model): trained on 5 features
+#     (ctr_norm, sentiment_norm, polarity_norm, trend_norm, conversions).
+#     Both ctr and conversions describe how a post ALREADY performed after
+#     posting -- they don't exist yet for a draft variant, so this model
+#     can't be fed correctly at the point predict_success() is called.
+#
+#   - train_pairwise() / "pairwise_predictor.joblib" (A/B-winner model,
+#     see auto_retrainer.py): trained on 6 features describing a PAIR of
+#     posts (sentA, sentB, trendA, trendB, engA, engB). It doesn't even
+#     take a single text as input, so it structurally can't answer "how
+#     good is this one variant."
+#
+# Loading either one here (as an earlier version of this file did, first
+# unfiltered and then filtered by a prefix) meant predict_success() could
+# feed a 3-element feature vector into a model expecting 5 or 6 columns --
+# raising at inference, or in the worst case, being accepted anyway if a
+# library doesn't validate shape and returning a meaningless prediction.
+#
+# Until a model is trained specifically on predict_success()'s 3-feature
+# schema, the honest choice is to always use the heuristic below rather
+# than gamble on a mismatched model "sort of" working.
+# ----------------------------------------------------------------------
 
 
 def _engagement_share(scoreA: float, scoreB: float) -> Tuple[float, float]:
@@ -72,7 +81,6 @@ class ABCoach:
         self.poster = SocialPoster()
         self.ingestor = SocialIngestor()
         self.trends = TrendFetcher()
-        self.model = _load_latest_model()
 
         try:
             self.slack = SlackNotifier()
@@ -87,14 +95,16 @@ class ABCoach:
     def _now_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def _persist_schedule(self, ab_id: str, campaign_id: str, jobA: str, jobB: str, runA: str, runB: str, eval_time: str):
-        if not SHEETS_ENABLED:
-            logger.debug("Sheets disabled: skipping persist_schedule")
-            return
-        try:
-            append_row("ab_schedule", [self._now_iso(), ab_id, campaign_id, jobA, jobB, runA, runB, eval_time])
-        except Exception as e:
-            logger.warning(f"Failed to write ab_schedule row: {e}")
+    # ------------------------------------------------------------------
+    # RESOLVED (Bug 2): _persist_schedule() was deleted. It wrote a second,
+    # duplicate row to "ab_schedule" for the same ab_id right after
+    # SocialPoster.schedule_ab_test() (called just above in
+    # create_and_schedule_ab_test()) had already persisted its own row for
+    # it -- same data, different column order. SocialPoster now owns
+    # ab_schedule exclusively, since it's the one holding the real job IDs
+    # at the moment of persistence. See sheets_connector.py's "ab_schedule"
+    # header comment.
+    # ------------------------------------------------------------------
 
     def _persist_ab_posts(self, ab_id: str, campaign_id: str, variant: str, post_id: str, ts: Optional[str] = None):
         if not SHEETS_ENABLED:
@@ -126,7 +136,8 @@ class ABCoach:
     ) -> Dict[str, Any]:
         """
         Schedules an A/B test using SocialPoster.schedule_ab_test.
-        Persists schedule to Sheets and optionally returns scheduled job ids.
+        SocialPoster persists the ab_schedule row itself (see the class-level
+        note above on why ABCoach no longer writes a second one).
         """
         logger.info(f"Scheduling A/B for campaign {campaign_id} at {run_date_A} / {run_date_B}")
         details = self.poster.schedule_ab_test(
@@ -140,13 +151,6 @@ class ABCoach:
 
         # details contains: {ab_id, jobA, jobB, jobEval}
         ab_id = details.get("ab_id")
-        jobA = details.get("jobA")
-        jobB = details.get("jobB")
-
-        eval_time = (run_date_B + timedelta(hours=eval_delay_hours)).isoformat()
-
-        # Persist schedule
-        self._persist_schedule(ab_id, campaign_id, jobA, jobB, run_date_A.isoformat(), run_date_B.isoformat(), eval_time)
 
         # Record initial posts may be saved by SocialPoster when executed. We still return scheduled info.
         if self.slack:
@@ -162,39 +166,25 @@ class ABCoach:
     # -----------------------
     def predict_success(self, text: str) -> float:
         """
-        Predict the probability of success for a single text using the latest saved model.
-        Model expected to accept features: sentiment_score, trend_score, length, maybe embeddings.
-        If no model available, return a heuristic score (0..1).
+        Predict the probability of success for a single text.
+
+        No trained model in this codebase currently matches this
+        function's 3-feature schema (sentiment_score, trend_score,
+        length) -- see the module-level note above for why the success
+        model and the pairwise A/B-winner model both don't apply here.
+        Always uses the heuristic below until a model is trained
+        specifically for this schema.
         """
         try:
-            # Basic features
             sent = analyze_sentiment(text)[0]  # returns list
             trend_score = self.trends.get_combined_trend_score(text)
             length = len(text.split())
 
-            # Build X in a compatible shape for model
-            features = [[sent.get("sentiment_score", 0), trend_score, length]]
-            if self.model:
-                try:
-                    proba = None
-                    # If model has predict_proba
-                    if hasattr(self.model, "predict_proba"):
-                        proba = self.model.predict_proba(features)[0]
-                        # assume binary classifier with [prob_neg, prob_pos] or similar: pick max positive
-                        if proba.shape and proba.shape[0] >= 1:
-                            # choose last column as positive class probability if shape >1
-                            prob = float(proba[-1]) if len(proba) > 1 else float(proba[0])
-                        else:
-                            prob = float(proba)
-                    else:
-                        # fallback to predict (0/1) and map to 0.75/0.25
-                        pred = self.model.predict(features)[0]
-                        prob = 0.75 if pred == 1 else 0.25
-                    return max(0.0, min(1.0, prob))
-                except Exception as e:
-                    logger.warning(f"Model prediction failed: {e}")
-            # Heuristic fallback
-            heuristic = (sent.get("sentiment_score", 0) * 0.5) + (trend_score / 100.0 * 0.4) + (min(length, 100) / 100.0 * 0.1)
+            heuristic = (
+                (sent.get("sentiment_score", 0) * 0.5)
+                + (trend_score / 100.0 * 0.4)
+                + (min(length, 100) / 100.0 * 0.1)
+            )
             return float(max(0.0, min(1.0, heuristic)))
         except Exception as e:
             logger.error(f"predict_success error: {e}")
@@ -344,7 +334,7 @@ class ABCoach:
 
         for r in rows:
             try:
-                # ab_schedule format: [ts, ab_id, campaign_id, jobA, jobB, runA, runB, eval_time]
+                # ab_schedule format: [ts, ab_id, campaign_id, jobA, run_date_A, jobB, run_date_B, eval_time]
                 if len(r) < 8:
                     logger.warning(f"Skipping short ab_schedule row (expected 8 cols, got {len(r)}): {r}")
                     continue

@@ -1,8 +1,5 @@
-# ============================================================
-# tracker3.py  (UPDATED FULL VERSION)
-# ============================================================
 """
-Tracker3 — Central Logging Layer
+tracker.py — Central Logging Layer
 
 This module standardizes logging across the project.
 Everything is logged via SHEETS CONNECTOR.
@@ -10,7 +7,7 @@ Everything is logged via SHEETS CONNECTOR.
 This includes:
     ✓ Raw sentiment feedback
     ✓ Aggregated sentiment metrics
-    ✓ A/B test results (simple version)
+    ✓ A/B test results (simple, campaign/variant-level version)
     ✓ Campaign events
 
 All heavy logic stays in:
@@ -34,7 +31,7 @@ if not logger.handlers:
     h.setLevel(logging.INFO)
     logger.addHandler(h)
 
-# --- Optional integrations (fix #3) -------------------------------------
+# --- Optional integrations -------------------------------------
 # These used to be hard imports with an eagerly-instantiated TrendFetcher(),
 # which meant a missing Sheets credential or trend API key would crash the
 # import of this entire module — including functions like log_campaign_event
@@ -104,9 +101,9 @@ def push_raw_feedback(items: List[Dict[str, Any]]):
     for item in items:
         text = item.get("text", "")
 
-        # Fix #2: wrap per-item analysis so one bad item (e.g. empty text
-        # causing analyze_sentiment()[0] to raise an IndexError) doesn't
-        # abort the rest of the batch silently.
+        # Wrap per-item analysis so one bad item (e.g. empty text causing
+        # analyze_sentiment()[0] to raise an IndexError) doesn't abort the
+        # rest of the batch silently.
         try:
             sentiment = analyze_sentiment(text)[0] if _SENTIMENT_AVAILABLE else {}
             trend_score = tf.get_combined_trend_score(text) if _TREND_AVAILABLE else 0.0
@@ -114,9 +111,6 @@ def push_raw_feedback(items: List[Dict[str, Any]]):
             logger.warning(f"Failed to analyze item {item.get('id', '')}: {e}")
             continue
 
-        # Fix #1: removed the bogus sentiment.get("trend_score") entry that
-        # was always None (analyze_sentiment never returns that key) and
-        # sat right before the real trend_score value below.
         row = [
             datetime.now(timezone.utc).isoformat(),
             item.get("id", ""),
@@ -175,7 +169,7 @@ def push_aggregates(metrics: Dict[str, Any]):
 
 
 # ============================================================
-# 3. PUSH A/B TEST RESULTS (Simple Version)
+# 3. PUSH A/B TEST RESULTS (Simple, campaign/variant-level version)
 # ============================================================
 
 def push_ab_test_results(campaign_id: str, results: List[Dict]):
@@ -190,6 +184,15 @@ def push_ab_test_results(campaign_id: str, results: List[Dict]):
             "conv_rate": 0.01
         }
     ]
+
+    RESOLVED (Bug 3): this used to write to the "ab_test_results" sheet,
+    which is also owned by ab_coach.py / social_poster.py with a completely
+    different, ab_id-based 7-column schema (postA/scoreA/postB/scoreB/winner)
+    that auto_retrainer.py reads for training. Writing this function's
+    8-column campaign/variant summary into that same sheet would corrupt
+    AutoRetrainer's training data. Moved to its own sheet,
+    "campaign_ab_summary", since this is a different kind of record
+    (a simple aggregate per variant) than a pairwise A/B winner result.
     """
 
     written = 0
@@ -206,10 +209,10 @@ def push_ab_test_results(campaign_id: str, results: List[Dict]):
             r.get("conv_rate", 0.0)
         ]
 
-        if _safe_append_row("ab_test_results", row):
+        if _safe_append_row("campaign_ab_summary", row):
             written += 1
 
-    logger.info(f"Logged {written}/{len(results)} A/B test result rows.")
+    logger.info(f"Logged {written}/{len(results)} campaign A/B summary rows.")
     return True
 
 
@@ -223,9 +226,9 @@ def log_campaign_event(event: str, info: Dict[str, Any]):
       log_campaign_event("A/B Test Started", {"variants": 3, "campaign": "XYZ"})
     """
 
-    # Fix #5: json.dumps instead of str(info) — str() on a dict produces
-    # Python repr syntax (single quotes, True/False/None) which is not
-    # valid JSON and can't be reliably parsed back downstream.
+    # json.dumps instead of str(info) — str() on a dict produces Python
+    # repr syntax (single quotes, True/False/None) which is not valid
+    # JSON and can't be reliably parsed back downstream.
     row = [
         datetime.now(timezone.utc).isoformat(),
         event,
@@ -243,7 +246,7 @@ def log_campaign_event(event: str, info: Dict[str, Any]):
 # ============================================================
 
 if __name__ == "__main__":
-    print("\nTracker3 updated version test.")
+    print("\nTracker test.")
 
     # Raw feedback example
     push_raw_feedback([
@@ -264,7 +267,7 @@ if __name__ == "__main__":
         "dominant_emotion": "joy"
     })
 
-    # A/B results example
+    # A/B summary example
     push_ab_test_results("test_campaign", [
         {"variant": "A", "impressions": 1200, "clicks": 100, "conversions": 8, "ctr": 0.083, "conv_rate": 0.08},
         {"variant": "B", "impressions": 1200, "clicks": 90, "conversions": 9, "ctr": 0.075, "conv_rate": 0.1}

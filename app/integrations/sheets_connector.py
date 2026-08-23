@@ -62,7 +62,6 @@ def create_sheet_if_not_exists(sheet_name: str) -> None:
 
         sheet_titles = [s["properties"]["title"] for s in spreadsheet.get("sheets", [])]
 
-        
         if sheet_name in sheet_titles:
             # Check if header row exists
             result = service.spreadsheets().values().get(
@@ -94,6 +93,13 @@ def create_sheet_if_not_exists(sheet_name: str) -> None:
         ).execute()
         logging.info(f"Sheet '{sheet_name}' created successfully.")
 
+        # A freshly-created sheet has no header row yet either -- the old
+        # code only called _add_headers_to_sheet() on the "sheet already
+        # existed but had no header" branch above, never on first creation.
+        # That left brand-new, append-only sheets (ab_schedule, ab_posts,
+        # etc.) header-less indefinitely.
+        _add_headers_to_sheet(service, sheet_name)
+
     except HttpError as error:
         logging.error(f"Error creating sheet '{sheet_name}': {error}")
         raise
@@ -102,38 +108,105 @@ def create_sheet_if_not_exists(sheet_name: str) -> None:
 def _add_headers_to_sheet(service, sheet_name: str):
     DEFAULT_HEADERS = {
         "trend_scores": [
-            "timestamp", "query", "score"
+            # Matches trend_based_optimizer.py's _log_to_sheets():
+            # append_row(sheet_name, [ts, preview, trend_score, keywords_str])
+            "timestamp", "content_preview", "trend_score", "trending_keywords"
         ],
         "generated_content": [
-            "timestamp",
-            "id",
-            "prompt",
-            "original_content",
-            "optimized_content",
-            "variant",
-            "score",
-            "trend_score",
-            "sentiment_score"
+            # Matches content_generator.py's generate_final_variations():
+            # append_row("generated_content", [ts, platform, topic[:40]+"...",
+            #                                   optimized_text[:80]+"...", trend_score])
+            "timestamp", "platform", "topic_preview", "content_preview", "trend_score"
         ],
         "sentiment_results": [
-            "timestamp", "text", "sentiment_label",
-            "sentiment_score", "polarity", "emotions",
-            "language", "trend_score"
+            # FIXED: was an 8-col header (incl. timestamp, emotions, language)
+            # that didn't match what's actually written. sentiment_analyzer.py's
+            # analyze_sentiment() only ever sends:
+            #   _safe_append_row("sentiment_results", [preview, label, norm_score, polarity, trend_score])
+            # -- 5 values, no timestamp, no emotions, no language.
+            "text_preview", "sentiment_label", "sentiment_score", "polarity", "trend_score"
         ],
         "raw_feedback": [
+            # Matches tracker3.py's push_raw_feedback() row exactly (9 values,
+            # single trend_score column -- the old duplicate
+            # trend_score_model/trend_score_engine header was the original bug).
             "timestamp", "id", "source", "text",
             "sentiment_label", "sentiment_score",
-            "polarity", "emotions",
-            "trend_score_model", "trend_score_engine"
+            "polarity", "emotions", "trend_score"
         ],
         "aggregates": [
+            # Confirmed against tracker3.py's push_aggregates() -- 10 values,
+            # order matches exactly. No change needed.
             "timestamp", "total", "avg_score",
             "pos_count", "neg_count", "neu_count",
             "pct_positive", "pct_negative",
             "avg_toxicity", "dominant_emotion"
         ],
         "campaign_logs": [
+            # Confirmed against tracker3.py's log_campaign_event() -- 3 values,
+            # order matches exactly. No change needed.
             "timestamp", "event", "info"
+        ],
+        "ab_schedule": [
+            # RESOLVED (Bug 2): social_poster.schedule_ab_test() is now the
+            # sole writer -- ab_coach._persist_schedule() was deleted, since
+            # it duplicated the same row a moment later in a different
+            # column order. This header matches social_poster's write:
+            #   [ts, ab_id, campaign_id, jobA, run_date_A, jobB, run_date_B, eval_time]
+            "timestamp", "ab_id", "campaign_id", "job_a", "run_date_a", "job_b", "run_date_b", "eval_time"
+        ],
+        "ab_posts": [
+            # Confirmed identical 5-col shape from ab_coach._persist_ab_posts()
+            # and social_poster._ab_post_A/_B().
+            "timestamp", "ab_id", "campaign_id", "variant", "post_id"
+        ],
+        "ab_test_results": [
+            # FIXED: column names must match auto_retrainer.py's
+            # REQUIRED_AB_COLUMNS = {"postA", "scoreA", "postB", "scoreB", "winner"}
+            # EXACTLY (case-sensitive) -- load_training_data() does
+            # REQUIRED_AB_COLUMNS.issubset(df.columns) against this header.
+            # The previous snake_case version (post_a, score_a...) would
+            # never match, so AutoRetrainer would always log "missing
+            # required columns" and silently return an empty DataFrame --
+            # retraining would never run, with no crash to reveal it.
+            "timestamp", "ab_id", "postA", "scoreA", "postB", "scoreB", "winner"
+        ],
+        "campaign_ab_summary": [
+            # RESOLVED (Bug 3): tracker.py's push_ab_test_results() used to
+            # write this 8-col, campaign/variant-based row to "ab_test_results",
+            # colliding with the ab_id-based schema ab_coach.py/social_poster.py
+            # own above. Moved to its own sheet -- see tracker.py.
+            "timestamp", "campaign_id", "variant", "impressions", "clicks", "conversions", "ctr", "conv_rate"
+        ],
+        "posted_content": [
+            # Confirmed from social_poster._execute_and_persist_post():
+            # row = [ts, campaign_id, variant, post_id, "twitter", text]
+            "timestamp", "campaign_id", "variant", "post_id", "platform", "text"
+        ],
+        "model_versions": [
+            # FIXED: was a 5-col guess. auto_retrainer.py's save_model() only
+            # ever writes:
+            #   append_row(self.config.sheet_model_versions, [timestamp, len(df), versioned_path])
+            # -- 3 values.
+            "timestamp", "num_samples", "model_path"
+        ],
+        "comment_sentiment": [
+            # FIXED: was a 4-col guess with a leading timestamp.
+            # sentiment_analyzer.py's analyze_post_comments() only ever writes:
+            #   _safe_append_row("comment_sentiment", [post_id, avg_sent, avg_pol, avg_toxic, json.dumps(labels)])
+            # -- 5 values, no timestamp.
+            "post_id", "avg_sentiment", "avg_polarity", "avg_toxicity", "labels"
+        ],
+        "campaigns": [
+            # NEW: metrics_hub.py's record_campaign_metrics() writes to a
+            # sheet called "campaigns" (distinct from "campaign_logs") that
+            # wasn't in DEFAULT_HEADERS at all -- 13 values:
+            #   append_row("campaigns", [ts, campaign_id, variant, post_id, platform,
+            #     impressions, clicks, conversions, ctr, conv_rate,
+            #     sentiment_score, trend_score, avg_comment_sentiment])
+            "timestamp", "campaign_id", "variant", "post_id", "platform",
+            "impressions", "clicks", "conversions", "ctr", "conv_rate",
+            "sentiment_score", "trend_score", "avg_comment_sentiment"
         ],
     }
 

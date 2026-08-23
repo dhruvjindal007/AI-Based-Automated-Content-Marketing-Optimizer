@@ -1,9 +1,9 @@
-# metrics_hub2.py (UPDATED — integrated with social ingestion, trends, sentiment, and Sheets)
+# metrics_hub.py
 """
-Metrics Hub — updated to integrate:
+Metrics Hub — integrates:
  - SocialIngestor (live metrics)
  - TrendFetcher (trend scores)
- - sentiment_analyzer2 (sentiment + emotions)
+ - sentiment_analyzer (sentiment + emotions)
  - integrations.sheets_connector (optional Google Sheets logging)
 
 Behavior:
@@ -46,22 +46,20 @@ except Exception:
 try:
     from app.integrations.social_ingestor import SocialIngestor
     _SOCIAL_INGESTOR_AVAILABLE = True
-    _INGESTOR = SocialIngestor()
 except Exception as e:
+    SocialIngestor = None
     _SOCIAL_INGESTOR_AVAILABLE = False
-    _INGESTOR = None
     logger.info(f"SocialIngestor not available: {e}")
 
 try:
     from app.integrations.trend_fetcher import TrendFetcher
     _TREND_AVAILABLE = True
-    _TRENDER = TrendFetcher()
 except Exception as e:
+    TrendFetcher = None
     _TREND_AVAILABLE = False
-    _TRENDER = None
     logger.info(f"TrendFetcher not available: {e}")
 
-# sentiment_analyzer2 provides analyze_sentiment(text) -> list(dict)
+# sentiment_analyzer provides analyze_sentiment(text) -> list(dict)
 # Wrapped in try/except (fix #1) so _SENTIMENT_AVAILABLE actually exists and
 # record_post_metrics_from_id's `if _SENTIMENT_AVAILABLE:` check works correctly
 # instead of raising a NameError that was being silently caught downstream.
@@ -73,6 +71,31 @@ except Exception as e:
     analyze_post_comments = None
     _SENTIMENT_AVAILABLE = False
     logger.info(f"sentiment_analyzer not available: {e}")
+
+# Lazy singletons -- previously SocialIngestor()/TrendFetcher() were built
+# eagerly at import time. This module is imported unconditionally by
+# streamlit_app.py, so that meant every app startup paid both handshake
+# costs immediately whether or not they're used, and was one of three
+# separate places doing an eager TrendFetcher() at import time (see
+# sentiment_analyzer.py and metrics_tracker.py for the other two).
+_INGESTOR = None
+_TRENDER = None
+
+
+def _get_ingestor():
+    global _INGESTOR
+    if _SOCIAL_INGESTOR_AVAILABLE and _INGESTOR is None:
+        logger.info("Starting SocialIngestor (one-time init)...")
+        _INGESTOR = SocialIngestor()
+    return _INGESTOR
+
+
+def _get_trender():
+    global _TRENDER
+    if _TREND_AVAILABLE and _TRENDER is None:
+        logger.info("Starting TrendFetcher (one-time init)...")
+        _TRENDER = TrendFetcher()
+    return _TRENDER
 
 
 # Environment flag for Sheets usage
@@ -208,12 +231,13 @@ def record_post_metrics_from_id(campaign_id: str, variant: str, post_id: str, pl
 
     This allows you to close the loop: post -> ingest -> record -> ML.
     """
-    if not _SOCIAL_INGESTOR_AVAILABLE:
+    ingestor = _get_ingestor()
+    if ingestor is None:
         logger.error("SocialIngestor not configured; cannot fetch post metrics.")
         return
 
     try:
-        data = _INGESTOR.fetch_complete_post_data(str(post_id))
+        data = ingestor.fetch_complete_post_data(str(post_id))
         metrics = data.get("metrics", {})
         text = data.get("text", "")
 
@@ -241,8 +265,9 @@ def record_post_metrics_from_id(campaign_id: str, variant: str, post_id: str, pl
 
         trend_score = 0.0
         try:
-            if _TREND_AVAILABLE:
-                trend_score = _TRENDER.get_combined_trend_score(text)
+            trender = _get_trender()
+            if trender is not None:
+                trend_score = trender.get_combined_trend_score(text)
         except Exception as e:
             logger.warning(f"Trend enrichment failed for post {post_id}: {e}")
 
@@ -250,8 +275,7 @@ def record_post_metrics_from_id(campaign_id: str, variant: str, post_id: str, pl
         engagement_est = int(likes) + int(shares) + int(replies)
 
         # Interpret impressions: use API value if present, else fall back to a
-        # rough engagement-based estimate. (Removed a dead earlier assignment
-        # of `impressions` that was overwritten unconditionally right here.)
+        # rough engagement-based estimate.
         impressions = int(metrics.get("impressions")) if metrics.get("impressions") else max(int(engagement_est * 100), 0)
 
         # Call core writer
@@ -273,7 +297,7 @@ def record_post_metrics_from_id(campaign_id: str, variant: str, post_id: str, pl
 
 
 # -----------------------------------------------------------
-# Fetch & Query Utilities (kept from previous version)
+# Fetch & Query Utilities
 # -----------------------------------------------------------
 
 def fetch_recent_metrics(limit: int = 50) -> pd.DataFrame:
@@ -381,7 +405,7 @@ def compute_variant_score(row: Dict[str, Any]) -> float:
 # Manual test / demo
 # -----------------------------------------------------------
 if __name__ == "__main__":
-    print("\nMetrics Hub v2 demo\n")
+    print("\nMetrics Hub demo\n")
 
     # Demo: record synthetic campaign row
     record_campaign_metrics(

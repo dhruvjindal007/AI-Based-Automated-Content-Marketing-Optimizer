@@ -1,7 +1,7 @@
 """
 Streamlit App (app.py)
 Run:
-    streamlit run app.py
+    streamlit run streamlit_app.py
 """
 
 import streamlit as st
