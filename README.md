@@ -193,7 +193,9 @@ AI-Content-Marketing-Optimizer/
 │   ├── integrations/
 │   │   ├── sheets_connector.py
 │   │   ├── slack_notifier.py
-│   │   ├── trend_fetcher.py
+│   │   ├── social_poster.py
+|   |   |── social_ingestor.py
+|   |   |── trend_fetcher.py
 │   │
 │   ├── metrics_engine/
 │   │   ├── metrics_hub.py
@@ -424,10 +426,10 @@ The **AutoRetrainer** also saves:
 ---
 ## 👥 Contributors
 
-### 👨‍💼 Project Lead  
+### 👨‍💼 Project Lead
 - **Charan Teja Mangali** — Lead Developer, System Architect & Mentor
 
-### 🎓 Student Contributors  
+### 🎓 Student Contributors
 - **Dhruv Jindal**
 
 ## 🤝 Contributing

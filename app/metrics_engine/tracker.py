@@ -14,9 +14,9 @@ This includes:
     ✓ Campaign events
 
 All heavy logic stays in:
-    - metrics_tracker2.py
-    - sentiment_analyzer2.py
-    - ab_coach2.py
+    - metrics_tracker.py
+    - sentiment_analyzer.py
+    - ab_coach.py
     - auto_retrainer.py
 
 This file focuses ONLY on clean and consistent logging.
@@ -24,13 +24,8 @@ This file focuses ONLY on clean and consistent logging.
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List
-
-from app.integrations.sheets_connector import append_row
-from app.sentiment_engine.sentiment_analyzer import analyze_sentiment
-from app.integrations.trend_fetcher import TrendFetcher
-
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -39,7 +34,52 @@ if not logger.handlers:
     h.setLevel(logging.INFO)
     logger.addHandler(h)
 
-tf = TrendFetcher()
+# --- Optional integrations (fix #3) -------------------------------------
+# These used to be hard imports with an eagerly-instantiated TrendFetcher(),
+# which meant a missing Sheets credential or trend API key would crash the
+# import of this entire module — including functions like log_campaign_event
+# that don't even need sentiment/trend data. Now each dependency degrades
+# gracefully and is checked before use.
+
+try:
+    from app.integrations.sheets_connector import append_row
+    _SHEETS_AVAILABLE = True
+except Exception as e:
+    append_row = None
+    _SHEETS_AVAILABLE = False
+    logger.info(f"sheets_connector not available — logging to Sheets disabled: {e}")
+
+try:
+    from app.sentiment_engine.sentiment_analyzer import analyze_sentiment
+    _SENTIMENT_AVAILABLE = True
+except Exception as e:
+    analyze_sentiment = None
+    _SENTIMENT_AVAILABLE = False
+    logger.info(f"sentiment_analyzer not available: {e}")
+
+try:
+    from app.integrations.trend_fetcher import TrendFetcher
+    tf = TrendFetcher()
+    _TREND_AVAILABLE = True
+except Exception as e:
+    TrendFetcher = None
+    tf = None
+    _TREND_AVAILABLE = False
+    logger.info(f"TrendFetcher not available: {e}")
+
+
+def _safe_append_row(sheet: str, row: List[Any]) -> bool:
+    """Small shared helper so every logging function checks availability
+    the same way instead of relying on append_row(None, ...) blowing up."""
+    if not _SHEETS_AVAILABLE:
+        logger.warning(f"Sheets not available — skipped writing to '{sheet}'.")
+        return False
+    try:
+        append_row(sheet, row)
+        return True
+    except Exception as e:
+        logger.warning(f"Could not write row to '{sheet}': {e}")
+        return False
 
 
 # ============================================================
@@ -59,13 +99,26 @@ def push_raw_feedback(items: List[Dict[str, Any]]):
       - text meta
     """
 
+    written = 0
+
     for item in items:
         text = item.get("text", "")
-        sentiment = analyze_sentiment(text)[0]
-        trend_score = tf.get_combined_trend_score(text)
 
+        # Fix #2: wrap per-item analysis so one bad item (e.g. empty text
+        # causing analyze_sentiment()[0] to raise an IndexError) doesn't
+        # abort the rest of the batch silently.
+        try:
+            sentiment = analyze_sentiment(text)[0] if _SENTIMENT_AVAILABLE else {}
+            trend_score = tf.get_combined_trend_score(text) if _TREND_AVAILABLE else 0.0
+        except Exception as e:
+            logger.warning(f"Failed to analyze item {item.get('id', '')}: {e}")
+            continue
+
+        # Fix #1: removed the bogus sentiment.get("trend_score") entry that
+        # was always None (analyze_sentiment never returns that key) and
+        # sat right before the real trend_score value below.
         row = [
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
             item.get("id", ""),
             item.get("source", ""),
             text[:150],
@@ -73,16 +126,13 @@ def push_raw_feedback(items: List[Dict[str, Any]]):
             sentiment.get("sentiment_score"),
             sentiment.get("polarity"),
             json.dumps(sentiment.get("emotions")),
-            sentiment.get("trend_score"),
             trend_score,
         ]
 
-        try:
-            append_row("raw_feedback", row)
-        except Exception as e:
-            logger.warning(f"Could not write raw feedback row: {e}")
+        if _safe_append_row("raw_feedback", row):
+            written += 1
 
-    logger.info(f"Pushed {len(items)} raw feedback items.")
+    logger.info(f"Pushed {written}/{len(items)} raw feedback items.")
     return True
 
 
@@ -106,7 +156,7 @@ def push_aggregates(metrics: Dict[str, Any]):
     """
 
     row = [
-        datetime.utcnow().isoformat(),
+        datetime.now(timezone.utc).isoformat(),
         metrics.get("total", 0),
         metrics.get("avg_score", 0),
         metrics.get("pos_count", 0),
@@ -118,11 +168,8 @@ def push_aggregates(metrics: Dict[str, Any]):
         metrics.get("dominant_emotion", "unknown")
     ]
 
-    try:
-        append_row("aggregates", row)
+    if _safe_append_row("aggregates", row):
         logger.info("Aggregates logged to Google Sheets.")
-    except Exception as e:
-        logger.warning(f"Failed to log aggregates: {e}")
 
     return True
 
@@ -145,9 +192,11 @@ def push_ab_test_results(campaign_id: str, results: List[Dict]):
     ]
     """
 
+    written = 0
+
     for r in results:
         row = [
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
             campaign_id,
             r.get("variant", ""),
             r.get("impressions", 0),
@@ -157,12 +206,10 @@ def push_ab_test_results(campaign_id: str, results: List[Dict]):
             r.get("conv_rate", 0.0)
         ]
 
-        try:
-            append_row("ab_test_results", row)
-        except Exception as e:
-            logger.warning(f"Failed to log A/B row: {e}")
+        if _safe_append_row("ab_test_results", row):
+            written += 1
 
-    logger.info(f"Logged {len(results)} A/B test result rows.")
+    logger.info(f"Logged {written}/{len(results)} A/B test result rows.")
     return True
 
 
@@ -176,17 +223,17 @@ def log_campaign_event(event: str, info: Dict[str, Any]):
       log_campaign_event("A/B Test Started", {"variants": 3, "campaign": "XYZ"})
     """
 
+    # Fix #5: json.dumps instead of str(info) — str() on a dict produces
+    # Python repr syntax (single quotes, True/False/None) which is not
+    # valid JSON and can't be reliably parsed back downstream.
     row = [
-        datetime.utcnow().isoformat(),
+        datetime.now(timezone.utc).isoformat(),
         event,
-        str(info)
+        json.dumps(info, default=str)
     ]
 
-    try:
-        append_row("campaign_logs", row)
+    if _safe_append_row("campaign_logs", row):
         logger.info(f"Event logged: {event}")
-    except Exception as e:
-        logger.warning(f"Failed to log event {event}: {e}")
 
     return True
 

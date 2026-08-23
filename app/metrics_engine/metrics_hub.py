@@ -14,7 +14,7 @@ Behavior:
 
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any, Optional, List
 
 import pandas as pd
@@ -62,7 +62,17 @@ except Exception as e:
     logger.info(f"TrendFetcher not available: {e}")
 
 # sentiment_analyzer2 provides analyze_sentiment(text) -> list(dict)
-from app.sentiment_engine.sentiment_analyzer import analyze_sentiment, analyze_post_comments
+# Wrapped in try/except (fix #1) so _SENTIMENT_AVAILABLE actually exists and
+# record_post_metrics_from_id's `if _SENTIMENT_AVAILABLE:` check works correctly
+# instead of raising a NameError that was being silently caught downstream.
+try:
+    from app.sentiment_engine.sentiment_analyzer import analyze_sentiment, analyze_post_comments
+    _SENTIMENT_AVAILABLE = True
+except Exception as e:
+    analyze_sentiment = None
+    analyze_post_comments = None
+    _SENTIMENT_AVAILABLE = False
+    logger.info(f"sentiment_analyzer not available: {e}")
 
 
 # Environment flag for Sheets usage
@@ -107,9 +117,14 @@ def record_campaign_metrics(
     """
     Store campaign metrics to CSV (and optionally Google Sheets).
     Keeps compatibility with previous schema, but enriches with trend/sentiment.
+
+    Note: trend_score is stored here on its native 0-100 scale (as fetched from
+    TrendFetcher). Normalization to 0-1 happens downstream in
+    compute_variant_score() and build_feature_vector() where it's combined with
+    0-1-scale features. If you change the storage scale, update both of those too.
     """
 
-    timestamp = datetime.utcnow().isoformat()
+    timestamp = datetime.now(timezone.utc).isoformat()
 
     # compute CTR & conversion rate safely
     ctr = (clicks / impressions) if impressions > 0 else 0.0
@@ -202,7 +217,6 @@ def record_post_metrics_from_id(campaign_id: str, variant: str, post_id: str, pl
         metrics = data.get("metrics", {})
         text = data.get("text", "")
 
-        impressions = metrics.get("impressions", 0) or 0
         likes = metrics.get("likes", 0) or 0
         shares = metrics.get("shares", 0) or 0
         replies = metrics.get("replies", 0) or 0
@@ -220,6 +234,8 @@ def record_post_metrics_from_id(campaign_id: str, variant: str, post_id: str, pl
                 # average comment sentiment if comments available
                 comment_stats = analyze_post_comments(post_id) if analyze_post_comments is not None else {}
                 avg_comment_sent = comment_stats.get("avg_sentiment") if isinstance(comment_stats, dict) else None
+            else:
+                logger.info(f"Sentiment analyzer unavailable; using default neutral sentiment for post {post_id}.")
         except Exception as e:
             logger.warning(f"Sentiment enrichment failed for post {post_id}: {e}")
 
@@ -233,7 +249,9 @@ def record_post_metrics_from_id(campaign_id: str, variant: str, post_id: str, pl
         # Use likes+shares+replies as proxy for engagement; treat 'likes' as positive engagement
         engagement_est = int(likes) + int(shares) + int(replies)
 
-        # Try to interpret impressions: if not present, fallback to engagement * 100 (very rough)
+        # Interpret impressions: use API value if present, else fall back to a
+        # rough engagement-based estimate. (Removed a dead earlier assignment
+        # of `impressions` that was overwritten unconditionally right here.)
         impressions = int(metrics.get("impressions")) if metrics.get("impressions") else max(int(engagement_est * 100), 0)
 
         # Call core writer
@@ -303,10 +321,16 @@ def fetch_variant_performance(campaign_id: str) -> Dict[str, Any]:
 def get_ml_training_data() -> pd.DataFrame:
     """
     Returns the full dataset for ML training (from historical CSV).
+    Logs how many rows are dropped due to missing values instead of
+    silently discarding them (fix #3).
     """
     try:
         df = pd.read_csv(HISTORICAL_CSV)
+        before = len(df)
         df = df.dropna()
+        dropped = before - len(df)
+        if dropped > 0:
+            logger.warning(f"get_ml_training_data: dropped {dropped} row(s) with missing values (of {before} total).")
         return df
     except Exception as e:
         logger.error(f"Failed to load ML training data: {e}")
@@ -320,24 +344,33 @@ def get_ml_training_data() -> pd.DataFrame:
 def build_feature_vector(row: Dict[str, Any]) -> Dict[str, Any]:
     """
     Converts a campaign row into an ML-ready feature vector.
+    trend_score is normalized from its native 0-100 scale to 0-1 (fix #2)
+    so it sits on the same scale as ctr/sentiment/polarity.
     """
     return {
         "ctr": float(row.get("ctr", 0.0)),
         "sentiment": float(row.get("sentiment", 0.0)),
         "polarity": float(row.get("polarity", row.get("sentiment", 0.0))),
-        "trend_score": float(row.get("trend_score", 0.0)),
+        "trend_score": float(row.get("trend_score", 0.0)) / 100.0,
         "conversions": int(row.get("conversions", 0))
     }
 
 def compute_variant_score(row: Dict[str, Any]) -> float:
     """
     Scoring function for ranking A/B variants (tunable).
+
+    ctr and sentiment are both ~0-1 scale, but trend_score is stored on a
+    0-100 scale, so it must be normalized before being weighted — otherwise
+    it dominates the score (fix #2). Example: ctr=0.1, sentiment=0.8,
+    trend=80 -> without normalization the score is driven almost entirely
+    by trend (0.05 + 0.24 + 16 vs. the intended 0.05 + 0.24 + 0.16).
     """
     try:
+        trend_norm = float(row.get("trend_score", 0.0)) / 100.0
         return round(
             float(row.get("ctr", 0.0)) * 0.5 +
             float(row.get("sentiment", 0.0)) * 0.3 +
-            float(row.get("trend_score", 0.0)) * 0.2,
+            trend_norm * 0.2,
             4
         )
     except Exception:
@@ -372,3 +405,7 @@ if __name__ == "__main__":
 
     print("\nML training data sample:")
     print(get_ml_training_data().head())
+
+    print("\ncompute_variant_score on demo row:")
+    demo_row = {"ctr": 0.12, "sentiment": 0.82, "trend_score": 42.0}
+    print(compute_variant_score(demo_row))

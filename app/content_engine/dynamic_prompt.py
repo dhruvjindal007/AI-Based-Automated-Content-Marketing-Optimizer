@@ -1,5 +1,5 @@
 """
-Improved dynamic_prompt3.py
+Improved dynamic_prompt.py
 
 Upgrades added:
 - Platform-specific content rules (Twitter, LinkedIn, Instagram, YouTube, Facebook)
@@ -11,9 +11,41 @@ Upgrades added:
 
 This version helps create highly personalized, platform-aware, trend-aware
 prompts for Generative AI content generation.
+
+CHANGELOG (vs. previous version)
+-------------------------------------------------------------
+1. FIXED: combined_keywords_str used `", ".join(set(combined_keywords))`.
+   set() has two problems here: (a) it scrambles iteration order
+   non-deterministically, so the exact same input produces a
+   differently-ordered keyword list in the prompt on every run -- bad
+   for reproducibility when comparing generated variants or debugging
+   why an LLM's output changed run to run. (b) it only dedupes on exact
+   string match, so "#AI" and "#ai" (or "AI" without the hash) both
+   survive as separate "duplicate" entries. Replaced with an
+   order-preserving, case/hash-normalized dedup.
+
+   Note: this was partially masking a real double-counting issue coming
+   from content_generator3.py, which calls this function with
+   `injected_keywords` (already = keywords + deduped(real_trends)) AND
+   passes the same `real_trends` again via `trends=`. The old set()
+   call absorbed that duplication silently. The new dedup logic here
+   still absorbs it correctly (exact/normalized duplicates are removed
+   regardless of which file introduced them), but if you're debugging
+   and see fewer keywords in the prompt than you expected, that's why --
+   it's not a bug, it's two call sites redundantly including the same
+   trends.
+
+2. IMPROVED: platform display names for the prompt header now use a
+   proper capitalization map instead of `.title()`, since
+   "linkedin".title() -> "Linkedin" and "youtube".title() -> "Youtube",
+   neither of which match the actual brand names ("LinkedIn",
+   "YouTube"). Purely cosmetic (only affects the text the LLM sees, not
+   functionality) but worth getting right since it's part of what's
+   sent to the model.
+-------------------------------------------------------------
 """
 
-from typing import List
+from typing import List, Optional
 
 
 # ----------------------------------------
@@ -55,6 +87,16 @@ PLATFORM_GUIDELINES = {
 """
 }
 
+# Proper brand-name capitalization for platform names shown in the prompt.
+# .title() alone gives "Linkedin"/"Youtube", which don't match real branding.
+PLATFORM_DISPLAY_NAMES = {
+    "twitter": "Twitter",
+    "instagram": "Instagram",
+    "linkedin": "LinkedIn",
+    "facebook": "Facebook",
+    "youtube": "YouTube",
+}
+
 
 # ----------------------------------------
 # 2. TONE PRESETS
@@ -85,12 +127,22 @@ CTA_OPTIONS = [
 
 
 def choose_cta(audience: str) -> str:
-    """Choose a CTA based on audience context."""
-    if "marketers" in audience.lower():
+    """
+    Choose a CTA based on audience context.
+
+    Note: checks are first-match-wins in this fixed priority order
+    (marketers > students > founders > default). If `audience` matches
+    more than one keyword (e.g. "Marketers & Founders"), only the first
+    match's CTA is used -- this is a deliberate simplification, not a
+    bug, but worth knowing if you're wondering why a mixed-audience
+    string didn't produce a "founders" CTA.
+    """
+    audience_lower = audience.lower()
+    if "marketers" in audience_lower:
         return "Follow for more marketing insights!"
-    if "students" in audience.lower():
+    if "students" in audience_lower:
         return "Save this tip for your next project!"
-    if "founders" in audience.lower():
+    if "founders" in audience_lower:
         return "Try this strategy today and scale faster!"
     return "Share your thoughts below!"
 
@@ -99,6 +151,26 @@ def choose_cta(audience: str) -> str:
 # 4. MAIN PROMPT GENERATOR
 # ----------------------------------------
 
+def _normalize_kw(kw: str) -> str:
+    """Lowercase + strip leading '#' for duplicate comparison, so '#AI',
+    'ai', and '#ai' are all recognized as the same keyword."""
+    return kw.strip().lstrip("#").lower()
+
+
+def _dedupe_ordered(items: List[str]) -> List[str]:
+    """Order-preserving, normalized de-dup. Keeps the FIRST occurrence's
+    original casing/formatting (e.g. keeps '#AI' if it appeared before
+    a later plain 'ai')."""
+    seen = set()
+    out = []
+    for item in items:
+        key = _normalize_kw(item)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
 def generate_engaging_prompt(
     topic: str,
     platform: str,
@@ -106,7 +178,7 @@ def generate_engaging_prompt(
     audience: str,
     tone: str = "positive",
     word_count: int = 50,
-    trends: List[str] = None,
+    trends: Optional[List[str]] = None,
     add_cta: bool = True
 ) -> str:
     """
@@ -116,14 +188,16 @@ def generate_engaging_prompt(
     - keywords → user-defined
     - trends → real-time trending hashtags or keywords
     """
-    platform = platform.lower()
-    platform_rules = PLATFORM_GUIDELINES.get(platform, PLATFORM_GUIDELINES["twitter"])
+    platform_key = platform.lower()
+    platform_rules = PLATFORM_GUIDELINES.get(platform_key, PLATFORM_GUIDELINES["twitter"])
+    platform_display = PLATFORM_DISPLAY_NAMES.get(platform_key, platform.title())
 
     tone_rule = TONE_STYLES.get(tone.lower(), TONE_STYLES["positive"])
 
-    # Combine keywords + trends
-    combined_keywords = keywords + (trends or [])
-    combined_keywords_str = ", ".join(set(combined_keywords))
+    # Combine keywords + trends, deduped and order-preserved (fixes the
+    # non-deterministic set() ordering + case/hash-insensitive dupes).
+    combined_keywords = _dedupe_ordered(keywords + (trends or []))
+    combined_keywords_str = ", ".join(combined_keywords)
 
     # CTA
     cta_text = choose_cta(audience) if add_cta else ""
@@ -134,7 +208,7 @@ You are a top-tier social media content creator.
 Create an engaging, viral-ready post based on the following details:
 
 Topic: {topic}
-Platform: {platform.title()}
+Platform: {platform_display}
 Target Audience: {audience}
 Keywords / Hashtags to include: {combined_keywords_str}
 Tone Style: {tone}

@@ -1,19 +1,14 @@
 # ab_coach.py
-"""
-A/B Testing
-"""
-
 import os
-import time
 import joblib
 import logging
-from typing import Dict, Any, Optional, Tuple, List
+from typing import Dict, Any, Optional, List, Tuple
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.integrations.social_poster import SocialPoster
 from app.integrations.social_ingestor import SocialIngestor
-from app.integrations.sheets_connector import append_row, read_rows, update_row, find_row
+from app.integrations.sheets_connector import append_row, read_rows, update_row
 from app.integrations.slack_notifier import SlackNotifier
 
 from app.sentiment_engine.sentiment_analyzer import analyze_sentiment, analyze_post_comments
@@ -29,6 +24,11 @@ if not logger.handlers:
 
 MODEL_DIR = os.getenv("MODEL_DIR", "models")
 SHEETS_ENABLED = bool(os.getenv("GOOGLE_SHEET_ID"))
+
+# Composite score weights. Must sum to 1.0.
+ENGAGEMENT_WEIGHT = 0.7
+SENTIMENT_WEIGHT = 0.2
+TREND_WEIGHT = 0.1
 
 
 def _load_latest_model() -> Optional[Any]:
@@ -50,20 +50,42 @@ def _load_latest_model() -> Optional[Any]:
         return None
 
 
+def _engagement_share(scoreA: float, scoreB: float) -> Tuple[float, float]:
+    """
+    Convert raw, unbounded engagement counts into a 0-100 "share" pair
+    that sums to 100, so they're comparable in scale to sentiment (0-100)
+    and trend score (0-100) when computing the composite score.
+
+    If both scores are 0 (e.g. metrics fetch failed for both), splits
+    evenly 50/50 rather than dividing by zero.
+    """
+    total = scoreA + scoreB
+    if total <= 0:
+        return 50.0, 50.0
+    shareA = (scoreA / total) * 100
+    shareB = (scoreB / total) * 100
+    return shareA, shareB
+
+
 class ABCoach:
     def __init__(self):
         self.poster = SocialPoster()
         self.ingestor = SocialIngestor()
         self.trends = TrendFetcher()
-        self.slack = SlackNotifier() if 'SlackNotifier' in globals() and SlackNotifier is not None else None
         self.model = _load_latest_model()
+
+        try:
+            self.slack = SlackNotifier()
+        except Exception as e:
+            logger.warning(f"SlackNotifier init failed, notifications disabled: {e}")
+            self.slack = None
 
     # -----------------------
     # Utilities
     # -----------------------
     @staticmethod
     def _now_iso() -> str:
-        return datetime.utcnow().isoformat()
+        return datetime.now(timezone.utc).isoformat()
 
     def _persist_schedule(self, ab_id: str, campaign_id: str, jobA: str, jobB: str, runA: str, runB: str, eval_time: str):
         if not SHEETS_ENABLED:
@@ -120,7 +142,6 @@ class ABCoach:
         ab_id = details.get("ab_id")
         jobA = details.get("jobA")
         jobB = details.get("jobB")
-        jobEval = details.get("jobEval")
 
         eval_time = (run_date_B + timedelta(hours=eval_delay_hours)).isoformat()
 
@@ -131,8 +152,8 @@ class ABCoach:
         if self.slack:
             try:
                 self.slack.send_message(f"Scheduled A/B test {ab_id} for campaign {campaign_id}. A:{run_date_A} B:{run_date_B}")
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Slack notification failed: {e}")
 
         return details
 
@@ -209,7 +230,8 @@ class ABCoach:
                         postA = post_id
                     elif variant == "B":
                         postB = post_id
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Skipping malformed ab_posts row {r}: {e}")
                 continue
 
         if not postA or not postB:
@@ -224,7 +246,7 @@ class ABCoach:
             metricsA = {}
             metricsB = {}
 
-        # Compute simple engagement-based scores (customizable)
+        # Raw engagement counts (unbounded)
         scoreA = (metricsA.get("likes", 0) + metricsA.get("shares", 0) + metricsA.get("replies", 0))
         scoreB = (metricsB.get("likes", 0) + metricsB.get("shares", 0) + metricsB.get("replies", 0))
 
@@ -232,11 +254,36 @@ class ABCoach:
         comment_info_A = analyze_post_comments(postA)
         comment_info_B = analyze_post_comments(postB)
 
-        # Combine into composite score (weights can be tuned)
-        compositeA = scoreA * 0.7 + (comment_info_A.get("avg_sentiment", 0) * 100) * 0.2 + (self.trends.get_combined_trend_score(metricsA.get("text", "") ) ) * 0.1
-        compositeB = scoreB * 0.7 + (comment_info_B.get("avg_sentiment", 0) * 100) * 0.2 + (self.trends.get_combined_trend_score(metricsB.get("text", "") ) ) * 0.1
+        trend_score_A = self.trends.get_combined_trend_score(metricsA.get("text", ""))
+        trend_score_B = self.trends.get_combined_trend_score(metricsB.get("text", ""))
+
+        # Convert raw engagement to a 0-100 share so it's on the same scale
+        # as sentiment (0-100) and trend score (0-100) before weighting --
+        # this is the fix for the original scale-mismatch bug.
+        engagement_share_A, engagement_share_B = _engagement_share(scoreA, scoreB)
+
+        compositeA = (
+            engagement_share_A * ENGAGEMENT_WEIGHT
+            + (comment_info_A.get("avg_sentiment", 0) * 100) * SENTIMENT_WEIGHT
+            + trend_score_A * TREND_WEIGHT
+        )
+        compositeB = (
+            engagement_share_B * ENGAGEMENT_WEIGHT
+            + (comment_info_B.get("avg_sentiment", 0) * 100) * SENTIMENT_WEIGHT
+            + trend_score_B * TREND_WEIGHT
+        )
 
         winner = "A" if compositeA > compositeB else ("B" if compositeB > compositeA else "tie")
+
+        # probA/probB: normalized composite scores that sum to 1, so they
+        # actually behave like a probability pair (fix for the original
+        # bug where probA/probB were just raw unbounded composite scores).
+        composite_total = compositeA + compositeB
+        if composite_total > 0:
+            probA = compositeA / composite_total
+            probB = compositeB / composite_total
+        else:
+            probA = probB = 0.5
 
         # Persist results
         try:
@@ -250,8 +297,8 @@ class ABCoach:
                 self.slack.send_message(
                     f"A/B Test {ab_id} completed for campaign {campaign_id}. Winner: {winner} (A={scoreA}, B={scoreB})"
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"Slack notification failed: {e}")
 
         result = {
             "ab_id": ab_id,
@@ -260,8 +307,12 @@ class ABCoach:
             "postB": postB,
             "scoreA": int(scoreA),
             "scoreB": int(scoreB),
-            "probA": float(compositeA),
-            "probB": float(compositeB),
+            "engagement_share_A": engagement_share_A,
+            "engagement_share_B": engagement_share_B,
+            "trend_score_A": trend_score_A,
+            "trend_score_B": trend_score_B,
+            "probA": float(probA),
+            "probB": float(probB),
             "compositeA": compositeA,
             "compositeB": compositeB,
             "winner": winner,
@@ -288,21 +339,27 @@ class ABCoach:
             logger.error(f"Failed to read ab_schedule: {e}")
             return results
 
-        cutoff = datetime.utcnow() - timedelta(hours=lookback_hours)
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+        _ = cutoff  # reserved for future use (see note below)
 
         for r in rows:
             try:
                 # ab_schedule format: [ts, ab_id, campaign_id, jobA, jobB, runA, runB, eval_time]
                 if len(r) < 8:
+                    logger.warning(f"Skipping short ab_schedule row (expected 8 cols, got {len(r)}): {r}")
                     continue
                 ab_id = r[1]
                 eval_time_str = r[7]
                 eval_time = datetime.fromisoformat(eval_time_str) if isinstance(eval_time_str, str) else None
-                if eval_time and eval_time <= datetime.utcnow():
+                if eval_time is None:
+                    logger.warning(f"Skipping ab_schedule row with unparseable eval_time: {r}")
+                    continue
+                if eval_time <= datetime.now(timezone.utc):
                     res = self.evaluate_ab_test(ab_id)
                     if res:
                         results.append(res)
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Skipping malformed ab_schedule row {r}: {e}")
                 continue
 
         return results
@@ -332,7 +389,7 @@ class ABCoach:
     # -----------------------
     # Utility: run a quick simulation (no posting) used before scheduling
     # -----------------------
-    def simulate_ab(self, textA, textB):
+    def simulate_ab(self, textA: str, textB: str) -> Dict[str, Any]:
         """
         Simple A/B scoring logic.
         Ensures scoreA and scoreB always exist.
@@ -356,6 +413,3 @@ class ABCoach:
             "recommended": winner,
             "explanation": explanation
         }
-
-
-# End of ABCoach

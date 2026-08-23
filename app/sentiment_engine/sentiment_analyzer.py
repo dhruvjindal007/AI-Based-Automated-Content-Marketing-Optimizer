@@ -1,17 +1,18 @@
-# sentiment_analyzer2.py (UPDATED FULL VERSION)
+# sentiment_analyzer.py (UPDATED FULL VERSION)
 """
-Advanced sentiment_analyzer2.py
+Advanced sentiment_analyzer.py
 
 Upgraded with:
 ---------------------------------
 1. Real social comment ingestion via SocialIngestor
 2. Trend awareness using TrendFetcher
 3. Google Sheets logging for sentiment results
-4. Unified output for pipeline integration (generator → optimizer → metrics)
-5. Strong fallbacks (HF → TextBlob)
+4. Unified output for pipeline integration (generator -> optimizer -> metrics)
+5. Strong fallbacks (HF -> TextBlob)
 6. Student-friendly readable structure
 """
 
+import json
 import logging
 from typing import List, Union, Dict
 
@@ -21,27 +22,58 @@ from textblob import TextBlob
 try:
     from transformers import pipeline
     HF_AVAILABLE = True
-except:
+except Exception:
     HF_AVAILABLE = False
 
 # Language detection
 try:
     from langdetect import detect
     LANG_AVAILABLE = True
-except:
+except Exception:
     LANG_AVAILABLE = False
-
-# New Integrations
-from app.integrations.social_ingestor import SocialIngestor
-from app.integrations.trend_fetcher import TrendFetcher
-from app.integrations.sheets_connector import append_row
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    logger.addHandler(_handler)
+
+# ------------------------------------------------------
+# Optional integrations (Fix #5: soft-degrade instead of hard-crash)
+# ------------------------------------------------------
+try:
+    from app.integrations.social_ingestor import SocialIngestor
+    SOCIAL_AVAILABLE = True
+except Exception as e:
+    SOCIAL_AVAILABLE = False
+    logger.warning("SocialIngestor unavailable, comment ingestion disabled: %s", e)
+
+try:
+    from app.integrations.trend_fetcher import TrendFetcher
+    TREND_AVAILABLE = True
+except Exception as e:
+    TREND_AVAILABLE = False
+    logger.warning("TrendFetcher unavailable, trend_score will be None: %s", e)
+
+try:
+    from app.integrations.sheets_connector import append_row
+    SHEETS_AVAILABLE = True
+except Exception as e:
+    SHEETS_AVAILABLE = False
+    logger.warning("Sheets connector unavailable, logging to Sheets disabled: %s", e)
 
 # Lazy-loaded HF models
 _senti_model = None
 _emotion_model = None
+
+# Fix #6: module-level singletons instead of per-call instantiation
+_trend_engine = TrendFetcher() if TREND_AVAILABLE else None
+_ingestor = SocialIngestor() if SOCIAL_AVAILABLE else None
+
+VALID_LABELS = ("POSITIVE", "NEGATIVE", "NEUTRAL")
 
 
 # ------------------------------------------------------
@@ -49,6 +81,7 @@ _emotion_model = None
 # ------------------------------------------------------
 def _init_sentiment_model():
     return pipeline("sentiment-analysis")
+
 
 def _init_emotion_model():
     return pipeline(
@@ -66,11 +99,18 @@ def detect_language(text: str) -> str:
         return "unknown"
     try:
         return detect(text)
-    except Exception:
+    except Exception as e:
+        logger.warning("Language detection failed: %s", e)
         return "unknown"
 
 
 def fallback_sentiment(text: str) -> Dict:
+    """
+    TextBlob-based fallback. Fix #4: score is normalized onto the same
+    0-1 "positivity" scale as the HF path (polarity in [-1, 1] -> [0, 1]),
+    rather than using abs(polarity) as if it were a confidence value.
+    A neutral text (polarity ~ 0) now lands near 0.5, not near 0.
+    """
     polarity = TextBlob(text).sentiment.polarity
     if polarity >= 0.05:
         label = "POSITIVE"
@@ -79,9 +119,11 @@ def fallback_sentiment(text: str) -> Dict:
     else:
         label = "NEUTRAL"
 
+    norm_score = (polarity + 1) / 2  # -1..1 -> 0..1
+
     return {
         "label": label,
-        "score": abs(polarity),
+        "score": norm_score,
         "polarity": polarity
     }
 
@@ -90,18 +132,40 @@ def simplify_emotion_output(raw_output: List[Dict]) -> Dict:
     return {x["label"]: float(x["score"]) for x in raw_output}
 
 
+def _safe_append_row(sheet: str, row: List) -> None:
+    """Fix #2: log failures instead of swallowing them silently."""
+    if not SHEETS_AVAILABLE:
+        return
+    try:
+        append_row(sheet, row)
+    except Exception as e:
+        logger.warning("Failed to append row to sheet '%s': %s", sheet, e)
+
+
+def _normalize_comment(c) -> str:
+    """Fix #9: SocialIngestor may return dicts (author/timestamp/text) rather
+    than plain strings. Normalize defensively instead of str(dict)-ing it."""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, dict):
+        for key in ("text", "comment", "body", "content"):
+            if key in c and isinstance(c[key], str):
+                return c[key]
+        logger.warning("Comment dict had no recognizable text field, coercing to str: %s", c)
+        return str(c)
+    return str(c)
+
+
 # ------------------------------------------------------
 # NEW FEATURE: Analyze sentiment of *live social comments*
 # ------------------------------------------------------
 def analyze_post_comments(post_id: str) -> Dict:
     """
-    Fetches comments using SocialIngestor → scores them →
+    Fetches comments using SocialIngestor -> scores them ->
     returns aggregated sentiment & toxicity.
     """
-    ingestor = SocialIngestor()
-    comments = ingestor.fetch_post_comments(post_id)
-
-    if not comments:
+    if not SOCIAL_AVAILABLE or _ingestor is None:
+        logger.warning("analyze_post_comments called but SocialIngestor is unavailable.")
         return {
             "post_id": post_id,
             "avg_sentiment": 0.5,
@@ -111,33 +175,46 @@ def analyze_post_comments(post_id: str) -> Dict:
             "samples": []
         }
 
-    results = analyze_sentiment(comments)
-    labels = {"POSITIVE": 0, "NEGATIVE": 0, "NEUTRAL": 0}
+    raw_comments = _ingestor.fetch_post_comments(post_id)
 
+    if not raw_comments:
+        return {
+            "post_id": post_id,
+            "avg_sentiment": 0.5,
+            "avg_polarity": 0.0,
+            "avg_toxicity": 0.0,
+            "labels": {},
+            "samples": []
+        }
+
+    comments = [_normalize_comment(c) for c in raw_comments]
+    results = analyze_sentiment(comments)
+
+    # Fix #10: don't KeyError on an unexpected label; bucket it instead
+    labels = {"POSITIVE": 0, "NEGATIVE": 0, "NEUTRAL": 0}
     for r in results:
-        labels[r["sentiment_label"]] += 1
+        lbl = r["sentiment_label"]
+        if lbl not in labels:
+            logger.warning("Unexpected sentiment_label '%s', bucketing as NEUTRAL", lbl)
+            lbl = "NEUTRAL"
+        labels[lbl] += 1
 
     avg_sent = sum(r["sentiment_score"] for r in results) / len(results)
     avg_pol = sum(r["polarity"] for r in results) / len(results)
 
-    # Toxicity (from emotions if available)
     avg_toxic = 0.0
     for r in results:
-        if "anger" in r["emotions"]:
-            avg_toxic += r["emotions"].get("anger", 0)
+        avg_toxic += r["emotions"].get("anger", 0)
     avg_toxic /= len(results)
 
-    # Log to Google Sheets
-    try:
-        append_row("comment_sentiment", [
-            post_id,
-            avg_sent,
-            avg_pol,
-            avg_toxic,
-            labels
-        ])
-    except:
-        pass
+    # Fix #7: dicts must be serialized before writing to a Sheets row
+    _safe_append_row("comment_sentiment", [
+        post_id,
+        avg_sent,
+        avg_pol,
+        avg_toxic,
+        json.dumps(labels)
+    ])
 
     return {
         "post_id": post_id,
@@ -150,7 +227,7 @@ def analyze_post_comments(post_id: str) -> Dict:
 
 
 # ------------------------------------------------------
-# MASTER FUNCTION — sentiment + emotion + trend awareness
+# MASTER FUNCTION - sentiment + emotion + trend awareness
 # ------------------------------------------------------
 def analyze_sentiment(texts: Union[str, List[str]]) -> List[Dict]:
     """
@@ -162,8 +239,12 @@ def analyze_sentiment(texts: Union[str, List[str]]) -> List[Dict]:
         "polarity": ...,
         "emotions": {joy: 0.2, ...},
         "language": ...,
-        "trend_score": ...   <-- NEW
+        "trend_score": ...   # None if TrendFetcher is unavailable
     }
+
+    Fix #1: this is the single place trend_score is computed. Downstream
+    callers (e.g. tracker3.push_raw_feedback) should read
+    result["trend_score"] instead of calling TrendFetcher again themselves.
     """
 
     if isinstance(texts, str):
@@ -178,28 +259,33 @@ def analyze_sentiment(texts: Union[str, List[str]]) -> List[Dict]:
         if _emotion_model is None:
             _emotion_model = _init_emotion_model()
 
-    trend_engine = TrendFetcher()
     results = []
 
     for text in texts:
         lang = detect_language(text)
 
         # SENTIMENT
+        used_hf = False
         if HF_AVAILABLE:
             try:
                 pred = _senti_model(text)[0]
                 label = pred["label"].upper()
                 score = float(pred["score"])
                 polarity = TextBlob(text).sentiment.polarity
-            except:
+                used_hf = True
+            except Exception as e:
+                logger.warning("HF sentiment model failed, falling back to TextBlob: %s", e)
                 s = fallback_sentiment(text)
                 label, score, polarity = s["label"], s["score"], s["polarity"]
         else:
             s = fallback_sentiment(text)
             label, score, polarity = s["label"], s["score"], s["polarity"]
 
-        if label.startswith("NEG"):
-            norm_score = 1 - score
+        # Fix #4: the (1 - score) inversion only makes sense for a genuine
+        # HF softmax confidence. fallback_sentiment() already returns a
+        # normalized 0-1 positivity score, so it passes through unchanged.
+        if used_hf:
+            norm_score = (1 - score) if label.startswith("NEG") else score
         else:
             norm_score = score
 
@@ -209,11 +295,17 @@ def analyze_sentiment(texts: Union[str, List[str]]) -> List[Dict]:
             try:
                 emo_raw = _emotion_model(text)[0]
                 emotions = simplify_emotion_output(emo_raw)
-            except:
+            except Exception as e:
+                logger.warning("HF emotion model failed: %s", e)
                 emotions = {}
 
-        # TREND SCORE (NEW)
-        trend_score = trend_engine.get_combined_trend_score(text)
+        # TREND SCORE
+        trend_score = None
+        if TREND_AVAILABLE and _trend_engine is not None:
+            try:
+                trend_score = _trend_engine.get_combined_trend_score(text)
+            except Exception as e:
+                logger.warning("TrendFetcher failed for text: %s", e)
 
         entry = {
             "text": text,
@@ -222,20 +314,19 @@ def analyze_sentiment(texts: Union[str, List[str]]) -> List[Dict]:
             "polarity": polarity,
             "emotions": emotions,
             "language": lang,
-            "trend_score": trend_score   # <-- integrated
+            "trend_score": trend_score
         }
 
-        # Save to Google Sheets
-        try:
-            append_row("sentiment_results", [
-                text[:80] + "...",
-                label,
-                norm_score,
-                polarity,
-                trend_score
-            ])
-        except:
-            pass
+        # Fix #8: only append "..." when actually truncated
+        preview = text if len(text) <= 80 else text[:80] + "..."
+
+        _safe_append_row("sentiment_results", [
+            preview,
+            label,
+            norm_score,
+            polarity,
+            trend_score
+        ])
 
         results.append(entry)
 

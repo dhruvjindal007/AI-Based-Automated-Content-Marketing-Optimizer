@@ -1,12 +1,11 @@
 # ============================================================
-# content_generator3.py (UPDATED FULL VERSION)
+# content_generator.py (UPDATED FULL VERSION)
 # ============================================================
-
 import os
 import logging
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timezone
 
 load_dotenv()
 
@@ -18,7 +17,7 @@ except Exception:
     GROQ_AVAILABLE = False
 
 try:
-    import genai
+    import google.generativeai as genai
     GEMINI_AVAILABLE = True
 except Exception:
     genai = None
@@ -57,6 +56,40 @@ if not logger.handlers:
 
 
 # ============================================================
+# Lazy singletons (LLM clients + LanguageTool)
+# ============================================================
+# LanguageTool spins up a local Java server on construction -- doing
+# that once per process instead of once per score_quality() call is the
+# single biggest performance fix in this file.
+
+_groq_client = None
+_gemini_configured = False
+_language_tool = None
+
+
+def _get_groq_client() -> "Groq":
+    global _groq_client
+    if _groq_client is None:
+        _groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    return _groq_client
+
+
+def _ensure_gemini_configured():
+    global _gemini_configured
+    if not _gemini_configured:
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        _gemini_configured = True
+
+
+def _get_language_tool():
+    global _language_tool
+    if _language_tool is None:
+        logger.info("Starting LanguageTool grammar server (one-time init)...")
+        _language_tool = language_tool_python.LanguageTool("en-US")
+    return _language_tool
+
+
+# ============================================================
 # Local fallback
 # ============================================================
 
@@ -69,7 +102,7 @@ def _local_generate(prompt: str, n: int = 3) -> List[str]:
 # ============================================================
 
 def _call_groq(prompt: str, model: str = None) -> str:
-    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    client = _get_groq_client()
     model = model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
     resp = client.chat.completions.create(
@@ -81,7 +114,7 @@ def _call_groq(prompt: str, model: str = None) -> str:
 
 
 def _call_gemini(prompt: str, model: str = None) -> str:
-    genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    _ensure_gemini_configured()
     model = model or os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
     gmodel = genai.GenerativeModel(model)
@@ -100,20 +133,35 @@ def generate_variations(prompt: str, n: int = 2) -> List[str]:
       1. Groq → LLaMA 3.3
       2. Gemini → 1.5 Flash
       3. Local fallback
+
+    Each individual call is guarded separately -- if some succeed and
+    one fails partway through, the successful ones are kept rather than
+    discarding all of them and falling all the way back to a weaker
+    source.
     """
     if GROQ_AVAILABLE and os.getenv("GROQ_API_KEY"):
-        try:
-            logger.info("Using Groq for content generation...")
-            return [_call_groq(prompt) for _ in range(n)]
-        except Exception:
-            logger.exception("Groq failed → trying Gemini...")
+        logger.info("Using Groq for content generation...")
+        results = []
+        for i in range(n):
+            try:
+                results.append(_call_groq(prompt))
+            except Exception as e:
+                logger.warning(f"Groq call {i+1}/{n} failed: {e}")
+        if results:
+            return results
+        logger.warning("All Groq calls failed -> trying Gemini...")
 
     if GEMINI_AVAILABLE and os.getenv("GEMINI_API_KEY"):
-        try:
-            logger.info("Using Gemini fallback...")
-            return [_call_gemini(prompt) for _ in range(n)]
-        except Exception:
-            logger.exception("Gemini failed → using local fallback...")
+        logger.info("Using Gemini fallback...")
+        results = []
+        for i in range(n):
+            try:
+                results.append(_call_gemini(prompt))
+            except Exception as e:
+                logger.warning(f"Gemini call {i+1}/{n} failed: {e}")
+        if results:
+            return results
+        logger.warning("All Gemini calls failed -> using local fallback...")
 
     logger.warning("Using LOCAL fallback generator.")
     return _local_generate(prompt, n)
@@ -130,15 +178,17 @@ def score_quality(text: str) -> Dict:
     if TEXTSTAT_AVAILABLE:
         try:
             readability_score = textstat.flesch_reading_ease(text)
-        except:
+        except Exception as e:
+            logger.warning(f"textstat scoring failed: {e}")
             readability_score = None
 
     if LT_AVAILABLE:
         try:
-            tool = language_tool_python.LanguageTool('en-US')
+            tool = _get_language_tool()
             matches = tool.check(text)
             grammar_issues = len(matches)
-        except:
+        except Exception as e:
+            logger.warning(f"LanguageTool check failed: {e}")
             grammar_issues = None
 
     return {
@@ -225,6 +275,12 @@ def optimize_with_engagement(candidates: List[Dict], past_metrics: Optional[Dict
 # FINAL PIPELINE — FULLY UPDATED
 # ============================================================
 
+def _normalize_keyword(kw: str) -> str:
+    """Lowercase + strip leading '#' so 'AI' and '#ai' are treated as
+    the same keyword when de-duplicating against real trends."""
+    return kw.strip().lstrip("#").lower()
+
+
 def generate_final_variations(
     topic: str,
     platform: str,
@@ -236,15 +292,22 @@ def generate_final_variations(
     past_metrics: Optional[Dict] = None
 ) -> List[Dict]:
 
-    # Normalize keywords
+    # Normalize keywords (strip whitespace, drop empties -- "AI, Marketing"
+    # used to produce ["AI", " Marketing"] with a leaked leading space)
     if isinstance(keywords, str):
-        keywords = keywords.split(",")
+        keywords = [k.strip() for k in keywords.split(",") if k.strip()]
 
     # NEW: Retrieve REAL trending keywords
     tf = TrendFetcher()
     real_trends = tf.fetch_google_global_trends()
 
-    injected_keywords = keywords + [t for t in real_trends if t not in keywords]
+    # Normalized de-dup: compare lowercased, '#'-stripped versions so
+    # "#AI" and "ai" are recognized as the same keyword instead of both
+    # being kept as if they were different.
+    existing_normalized = {_normalize_keyword(k) for k in keywords}
+    injected_keywords = keywords + [
+        t for t in real_trends if _normalize_keyword(t) not in existing_normalized
+    ]
 
     # Build dynamic prompt with trend-aware keywords
     prompt = generate_engaging_prompt(
@@ -297,14 +360,14 @@ def generate_final_variations(
         # Log each generated variant to Sheets
         try:
             append_row("generated_content", [
-                datetime.utcnow().isoformat(),
+                datetime.now(timezone.utc).isoformat(),
                 platform,
                 topic[:40] + "...",
                 optimized_text[:80] + "...",
                 item.get("trend_score", 0)
             ])
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to log generated content to Sheets: {e}")
 
     return results
 
