@@ -16,7 +16,7 @@ pytrends
 textblob
 langdetect==1.0.9
 transformers==4.41.2
-torch==2.2.2 --index-url https://download.pytorch.org/whl/cu118
+torch==2.2.2
 
 # Grammar & Readability
 language-tool-python
